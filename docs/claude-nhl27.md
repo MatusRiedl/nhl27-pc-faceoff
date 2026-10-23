@@ -734,7 +734,8 @@ the range's CPU state are unchanged): one boot with three variants, draw cost 4.
 paired rounds 378 / 370. Reusing identical flattened-SRT and shader-data uploads within a lap of
 the stream buffer: draw cost -2% but 378 / 407 fps in the same boot, dropped.
 
-Readback waits of the execution thread (`NHL27RBWAIT`; `KytyPS5-toolsbwait-by-mask.py`) were
+Readback waits of the execution thread (`NHL27RBWAIT`; `KytyPS5-tools
+bwait-by-mask.py`) were
 65-92 ms/s in play with bit 4 off, nearly all synchronous downloads for command-processor read
 faults on bytes the GPU never wrote (pages NHL 27 shares between command buffers and the 16
 bytes a compute shader writes). Bit 34 `KYTY_FALSE_SHARE_ANY_THREAD` is now on by default: such a
