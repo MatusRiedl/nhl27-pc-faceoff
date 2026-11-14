@@ -228,6 +228,7 @@ private:
 	void    V_ADD_LSHL_U32(const Decoder::Instruction& inst);
 	void    V_XAD_U32(const Decoder::Instruction& inst);
 	void    V_LSHL_OR_B32(const Decoder::Instruction& inst);
+	void    V_PERM_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 	void    V_CVT_PK_16_32(const Decoder::Instruction& inst, bool sign);
