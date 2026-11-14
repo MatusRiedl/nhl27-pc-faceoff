@@ -361,9 +361,11 @@ public:
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			// A read-only use of a region without CPU-dirty pages has nothing to upload (a CPU
-			// write racing with this check is one that lands after the synchronization).
-			if (!is_written && !manager->HasCpuDirty()) {
+			// A read-only use of a range without CPU-dirty pages has nothing to upload (a CPU write racing
+			// with this check is one that lands after the synchronization). The region flag is the cheap
+			// test; the range test (upstream db3f2758) skips the lock when only other pages are dirty.
+			if (!is_written && (!manager->HasCpuDirty() ||
+			                    !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes))) {
 				return;
 			}
 			manager->lock.lock();
