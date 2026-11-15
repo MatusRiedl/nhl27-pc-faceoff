@@ -205,8 +205,11 @@ void PrintEnvironment(uint64_t mask) {
 	}
 #endif
 	std::sort(vars.begin(), vars.end());
-	static constexpr std::array<const char*, 9> Private = {"ID", "ACCOUNT", "REDIRECT", "PATH", "DIR", "FILE",
-	                                                       "TOKEN", "KEY", "HOST"};
+	// No real switch has a word from the last two rows; they cover names a player might set by hand.
+	static constexpr std::array<const char*, 23> Private = {
+	    "ID",    "ACCOUNT", "REDIRECT", "PATH",   "DIR",  "FILE",     "TOKEN",  "KEY",
+	    "HOST",  "USER",    "USERNAME", "NAME",   "PASS", "PASSWORD", "SECRET", "MAIL",
+	    "EMAIL", "URL",     "IP",       "SERVER", "HOME", "ROOT",     "ADDRESS"};
 	for (const auto& var: vars) {
 		if (!var.starts_with("KYTY_") && !var.starts_with("NHL27")) {
 			continue;
