@@ -2171,11 +2171,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 					            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
 				}
 			}
-			if (downloaded) {
+			// A write hands its own pages from the GPU to the CPU in one critical section
+			// (TakeGpuPagesForCpu, upstream PR 1412), also when nothing was downloaded. The rest of a
+			// widened download window (WideWriteDownloads, KYTY_READBACK_WINDOW_KIB) is released here;
+			// releasing the write's pages twice is harmless, the second release is the atomic one.
+			if (downloaded && !(is_write && download_vaddr == vaddr && download_size == size)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
 			}
 			if (is_write) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				m_memory_tracker.TakeGpuPagesForCpu(vaddr, size);
 			}
 		});
 		if (split) {

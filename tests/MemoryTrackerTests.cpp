@@ -793,6 +793,42 @@ void TestGpuMarkingSkipsCpuDirtyPages() {
   Release(memory);
 }
 
+// Upstream PR 1412: a guest write over GPU-claimed pages releases the GPU's claim and takes the
+// pages for the CPU in one call, without the "CPU dirty state conflicts" exit, and leaves the
+// neighbouring GPU page alone.
+void TestTakeGpuPagesForCpu() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsGpuModified(address, page_size * 2);
+  Check(tracker.IsRegionGpuModified(address, page_size * 2) &&
+            !tracker.IsRegionCpuModified(address, page_size * 2),
+        "setup did not give both pages to the GPU");
+  const auto generation = tracker.CpuModificationGeneration();
+  tracker.TakeGpuPagesForCpu(address + 8, 16);
+  Check(!tracker.IsRegionGpuModified(address, page_size) &&
+            tracker.IsRegionCpuModified(address, page_size),
+        "the written page did not move from the GPU to the CPU");
+  Check(tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            !tracker.IsRegionCpuModified(address + page_size, page_size),
+        "the neighbouring GPU page changed");
+  Check(tracker.CpuModificationGeneration() != generation,
+        "taking pages for the CPU did not invalidate preparation");
+  // Taking a page the GPU no longer claims is a plain CPU claim.
+  tracker.TakeGpuPagesForCpu(address, 8);
+  Check(tracker.IsRegionCpuModified(address, page_size),
+        "a second take lost the CPU claim");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestRangeInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1571,6 +1607,7 @@ int main(int argc, char **argv) {
   TestRegionCpuDirtyEpoch();
   TestConsumeCpuWrites();
   TestGpuMarkingSkipsCpuDirtyPages();
+  TestTakeGpuPagesForCpu();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
