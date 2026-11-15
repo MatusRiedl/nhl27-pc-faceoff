@@ -51,6 +51,7 @@
 #include <string_view>
 #include <unordered_set>
 #include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 
 #ifdef min
 #undef min
@@ -908,18 +909,36 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		// Block-compressed images whose format has no storage support on this device (e.g.
 		// BC6H on AMD) are created without STORAGE usage; a storage view on them is invalid and
-		// hangs the GPU. Drop the guest's writes into a null storage image instead.
+		// hangs the GPU. By default the guest's writes go to a null storage image. With
+		// KYTY_BC_STORAGE_SHADOW=1 (duy64 2264c5ea) a binding whose view matches the block-storage
+		// shadow's shape is let through, so TextureCache::FindTexture substitutes the shadow, which
+		// takes the writes and flushes them back into the real image.
 		if (image->backing.image != nullptr &&
 		    !(image->backing.usage & vk::ImageUsageFlagBits::eStorage)) {
-			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-			if (!warned.test_and_set(std::memory_order_relaxed)) {
-				std::printf("Warning: dropping storage writes to %s image without storage usage\n",
-				            vk::to_string(image->info.pixel_format).c_str());
+			static const bool shadow_enabled = [] {
+				const char* e = std::getenv("KYTY_BC_STORAGE_SHADOW");
+				return e != nullptr && std::strcmp(e, "1") == 0;
+			}();
+			// Must match FindTexture's shadow substitution exactly: anything wider would build the
+			// invalid view this gate exists to prevent.
+			const bool shadowable = image->NeedsStorageShadow() && desc.view_info.level_count == 1 &&
+			                        vk::blockExtent(desc.view_info.format)[0] == 1 &&
+			                        vk::blockSize(desc.view_info.format) == image->info.bytes_per_block;
+			const bool shadow = shadow_enabled && shadowable;
+			// Logged first 4 times, then at powers of two, so a player log shows whether the game
+			// hits the drop and whether the shadow would take it.
+			static std::atomic<uint32_t> s_hits {0};
+			if (const auto n = s_hits.fetch_add(1, std::memory_order_relaxed); n < 4 || (n & (n - 1)) == 0) {
+				std::printf("NHL27BCSTORAGE #%u %s format=%s view=%s shadowable=%d\n", n + 1,
+				            shadow ? "shadow" : "drop", vk::to_string(image->info.pixel_format).c_str(),
+				            vk::to_string(desc.view_info.format).c_str(), shadowable ? 1 : 0);
 				std::fflush(stdout);
 			}
-			auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
-			const auto null_id   = texture_cache.FindImage(null_desc);
-			return {null_id, nullptr, std::move(null_desc)};
+			if (!shadow) {
+				auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
+				const auto null_id   = texture_cache.FindImage(null_desc);
+				return {null_id, nullptr, std::move(null_desc)};
+			}
 		}
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
