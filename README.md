@@ -22,8 +22,8 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
   **Play NHL 27**. Faceoff checks the game, the emulator and the shader cache and shows a check mark for each.
 - ⚡ **A tuned emulator.** NHL 27 runs on our build of [duy64/KytyPS5-nhl](https://github.com/duy64/KytyPS5-nhl), a
   KytyPS5 fork: the game's own frame pacing (30 fps menus, 60 fps play), PGO and AVX2 builds, and fixes for Be a Pro
-  crashes and broken images. v0.10.0 adds smoother play: batched memory faults and locks that stop burning the CPU.
-- 🔀 **Pick your build.** v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
+  crashes and broken images. v0.10 adds smoother play: batched memory faults and locks that stop burning the CPU.
+- 🔀 **Pick your build.** v0.10.1, v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
   and is checked against its SHA-256.
 - 🎛 **Settings in one place.** Resolution (720p to 4K), windowed or fullscreen, render scale and trophy pop-ups.
 - 🔄 **Updates itself.** Faceoff checks for a new release when it starts and installs it in one click.
@@ -40,7 +40,7 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
 
 ## 🚀 Get started
 
-1. Download `Faceoff-v0.10.0.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
+1. Download `Faceoff-v0.10.1.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
    to (not inside `Program Files`, at least 2 GB free).
 2. Start `Faceoff.exe`. Windows SmartScreen warns because the exe is not signed: choose **More info**, then
    **Run anyway**.
@@ -49,7 +49,7 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
    that happens once.
 
 **Coming from RC5:** Faceoff offers the update by itself and keeps your saves and shader cache. Take the new
-`Faceoff.exe` from the release once by hand: RC5's launcher reads 0.10.0 as older.
+`Faceoff.exe` from the release once by hand: RC5's launcher reads 0.10.x as older. From v0.10.0, everything updates by itself.
 
 Step by step, with controls and troubleshooting: [QUICKSTART.md](QUICKSTART.md).
 

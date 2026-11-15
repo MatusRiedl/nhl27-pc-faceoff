@@ -24,7 +24,7 @@
       "KYTY_NHL_RES_SCALE": "0.6667",
       "KYTY_OUTPUT_1080P": "0",
 
-      "KYTY_LAZY_SHARED_WRITES": "1",
+      "KYTY_LAZY_SHARED_WRITES": "0",
       "KYTY_PROTECT_SHARED_LOCK": "1",
       "KYTY_CLOCK_WAIT_PREDICT": "1",
       "KYTY_CP_CLEAN_REG_READS": "1",
@@ -78,7 +78,13 @@
       "KYTY_WRITE_COVER_SKIP": "1",
       "KYTY_AGED_WRITEBACK": "1",
       "KYTY_COMPUTE_RESOLVE_AHEAD": "1",
-      "KYTY_SRT_CFG_SCHEDULE": "1"
+      "KYTY_SRT_CFG_SCHEDULE": "1",
+
+      "KYTY_FAULT_COALESCE_PAGES": "64",
+      "KYTY_UNMAP_DISCARD": "1",
+      "KYTY_STENCIL_OWN_PLANE": "1",
+      "KYTY_HTILE_OWNER": "1",
+      "KYTY_SPIN_YIELD": "1"
     }
   }
 }
