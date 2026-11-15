@@ -103,6 +103,10 @@ duy64 (KytyPS5-nhl and its NHL 27 fixes), nmzik, TheCruZ, Artyom Zabroda, superk
 [KytyPS5](https://github.com/KytyPS5/KytyPS5) authors, on top of the original [Kyty](https://github.com/InoriRus/Kyty).
 AnyPS5 (boykopovar) was used as a reference only; no code was copied from it.
 
+Upscaling SDKs (binaries only, under their own licences in `licenses/`): NVIDIA DLSS SDK 310.9.16 (DLSS Super
+Resolution via NGX, (c) NVIDIA Corporation) and Intel XeSS SDK 3.0.2 (XeSS Super Resolution, (c) Intel Corporation).
+NVIDIA, DLSS, Intel and XeSS are trademarks of their owners; this project is not affiliated with or endorsed by them.
+
 The changes, measurements and notes were made with an AI coding assistant (Claude) driving the builds, test runs and
 log analysis; play testing is by hand. Each release's details are in [CHANGELOG.md](CHANGELOG.md).
 
