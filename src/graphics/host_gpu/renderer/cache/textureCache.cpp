@@ -2684,11 +2684,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
-	if (!selected) {
-		return false;
-	}
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId selected) {
 	buffer.last_write_tick = m_scheduler.CurrentTick();
 
 	std::scoped_lock lock {m_texture_cache.m_lock};

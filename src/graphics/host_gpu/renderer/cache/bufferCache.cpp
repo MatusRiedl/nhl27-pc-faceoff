@@ -2406,7 +2406,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    ImageId image) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -2467,9 +2467,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
+	if (image) {
 		FrameBreakdown::Timer image_timer(bs.sb_image_ns[bi], bon);
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+		return SynchronizeBufferFromImage(buffer, image);
 	}
 	return false;
 }
@@ -2616,9 +2616,34 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// A formatted read that starts at a GPU-written image gets a buffer over the whole image, so
+	// SynchronizeBufferFromImage can download every level. A buffer over only the read misses the
+	// levels past it: a read smaller than level 0 kept the stale guest bytes, and so did a later
+	// read of the rest of the image (upstream PR 2193). The buffer is not grown over bytes past the
+	// read that the GPU wrote as buffer data, which the download would overwrite. The image is
+	// looked up once here, where SynchronizeBuffer used to look it up again.
+	ImageId  image {};
+	uint64_t end               = vaddr + size;
+	bool     written_past_read = false;
+	if (texel_candidate) {
+		image = m_texture_cache.FindImageFromRange(vaddr, size);
+	}
+	if (image) {
+		const auto image_end = [&] {
+			std::scoped_lock lock {m_texture_cache.m_lock};
+			const auto&      range = m_texture_cache.m_slot_images[image].info.data;
+			// A stencil read resolves to its depth image, which starts elsewhere: no growth.
+			return range.address == vaddr ? range.End() : end;
+		}();
+		if (image_end > end) {
+			written_past_read = m_memory_tracker.IsRegionGpuModified(end, image_end - end);
+			end               = written_past_read ? end : image_end;
+		}
+	}
+	// The stream buffer copies guest bytes, which are stale under a GPU-written image.
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && (!image || written_past_read)) {
 		// Draws stream the same small buffers (frame and pass constants) again and again. Within
 		// a draw window the guest cannot have written them since the last copy, so draws share it
 		// while it is in the stream buffer and no work wrote cached buffers.
@@ -2651,10 +2676,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
 		FrameBreakdown::Timer find_timer(bs.ob_find_ns, bon);
 		if (bon) bs.ob_find_calls.fetch_add(1, std::memory_order_relaxed);
-		id = FindBuffer(vaddr, size);
+		id = FindBuffer(vaddr, end - vaddr);
 	}
 	auto& buffer = m_slot_buffers[id];
 	{
@@ -2665,7 +2690,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	{
 		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
 		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
-		synced_from_image = SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+		synced_from_image = SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
 	}
 	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
 	if (plain_read || (texel_read && !synced_from_image)) {
@@ -2846,7 +2871,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
-			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, {});
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
@@ -3392,7 +3417,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			const auto start  = std::max(buffer.CpuAddress(), span);
 			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 			if (start < finish) {
-				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, {});
 			}
 		}
 	});
@@ -3436,7 +3461,7 @@ bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, const
 				    const auto start  = std::max(buffer.CpuAddress(), span);
 				    const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 				    if (start < finish) {
-					    (void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+					    (void)SynchronizeBuffer(buffer, start, finish - start, false, {});
 				    }
 			    }
 		    });
