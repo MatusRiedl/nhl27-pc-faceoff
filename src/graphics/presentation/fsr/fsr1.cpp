@@ -47,7 +47,7 @@ struct Fsr1::Impl {
 		const auto required = vk::FormatFeatureFlagBits::eColorAttachment |
 							  vk::FormatFeatureFlagBits::eSampledImage |
 							  vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
-							  vk::FormatFeatureFlagBits::eBlitSrc;
+							  vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst;
 		if ((physical.getFormatProperties(FORMAT).optimalTilingFeatures & required) != required)
 			return false;
 		if (extent != target) {
@@ -59,7 +59,8 @@ struct Fsr1::Impl {
 			info.mipLevels = info.arrayLayers = 1;
 			info.samples = vk::SampleCountFlagBits::e1;
 			info.usage = vk::ImageUsageFlagBits::eColorAttachment |
-						 vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
+						 vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+						 vk::ImageUsageFlagBits::eTransferDst;
 			for (auto& image : images) {
 				if (device.createImage(&info, nullptr, &image.handle) != vk::Result::eSuccess)
 					return false;
@@ -261,6 +262,25 @@ vk::Image Fsr1::Record(vk::CommandBuffer command, vk::ImageView source, vk::Exte
 		source = m->images[0].view;
 	}
 	m->Pass(command, source, 1, settings);
+	m->Transit(command, m->images[1], vk::ImageLayout::eTransferSrcOptimal);
+	return m->images[1].handle;
+}
+vk::Image Fsr1::RecordDownscaled(vk::CommandBuffer command, vk::Image source, vk::Extent2D input,
+								 vk::Extent2D output, float sharpness) {
+	if (!source || !command || !std::isfinite(sharpness) || !output.width || !output.height ||
+		output.width > input.width || output.height > input.height || !m->Create(output))
+		return nullptr;
+	m->Transit(command, m->images[0], vk::ImageLayout::eTransferDstOptimal);
+	vk::ImageBlit region {};
+	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.srcOffsets[1] = vk::Offset3D {static_cast<int32_t>(input.width), static_cast<int32_t>(input.height), 1};
+	region.dstSubresource = region.srcSubresource;
+	region.dstOffsets[1] = vk::Offset3D {static_cast<int32_t>(output.width), static_cast<int32_t>(output.height), 1};
+	command.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, m->images[0].handle,
+					  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+	m->Transit(command, m->images[0], vk::ImageLayout::eShaderReadOnlyOptimal);
+	const Settings settings {output, output, std::clamp(sharpness, 0.0f, 1.0f)};
+	m->Pass(command, m->images[0].view, 1, settings);
 	m->Transit(command, m->images[1], vk::ImageLayout::eTransferSrcOptimal);
 	return m->images[1].handle;
 }

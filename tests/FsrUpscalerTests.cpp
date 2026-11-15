@@ -392,11 +392,21 @@ int main() {
 		const auto patterned = fsr.Record(command, color.view, input, output, 0.0f);
 		Check(bool(patterned), "FSR1 patterned upscaling, zero sharpening");
 		verify(patterned, output, vk::ImageLayout::eTransferSrcOptimal, true);
+		// A frame larger than the window: downscale, then RCAS at the window size.
+		const vk::Extent2D half {input.width / 2, input.height / 2};
+		begin();
+		barrier(color.resource.image, color.layout, vk::ImageLayout::eTransferSrcOptimal);
+		Check(!fsr.RecordDownscaled(command, color.resource.image, input, output, 0.2f),
+			  "reject upscale through the downscale path");
+		const auto shrunk = fsr.RecordDownscaled(command, color.resource.image, input, half, 0.5f);
+		barrier(color.resource.image, vk::ImageLayout::eTransferSrcOptimal, color.layout);
+		Check(bool(shrunk), "FSR1 downscale+RCAS");
+		verify(shrunk, half, vk::ImageLayout::eTransferSrcOptimal, true);
 	}
 	begin();
 	clear(color, {0.25f, 0.5f, 0.75f, 1});
 	submit();
-	std::puts("FSR1 PASS: EASU+RCAS, reuse, native RCAS, resize, downscale rejection, quadrant "
+	std::puts("FSR1 PASS: EASU+RCAS, reuse, native RCAS, resize, downscale rejection, downscale+RCAS, quadrant "
 			  "orientation and zero sharpening");
 #if KYTY_ENABLE_FSR3
 	auto depth = image(vk::Format::eR32Sfloat, input);
