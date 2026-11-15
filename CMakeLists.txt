@@ -462,6 +462,9 @@ if(KYTY_ENABLE_XESS)
 	if(EXISTS "${XESS_SDK_DIR}/LICENSE.txt")
 		install(FILES "${XESS_SDK_DIR}/LICENSE.txt" DESTINATION licenses/XeSS-SDK)
 	endif()
+	if(EXISTS "${XESS_SDK_DIR}/third-party-programs.txt")
+		install(FILES "${XESS_SDK_DIR}/third-party-programs.txt" DESTINATION licenses/XeSS-SDK)
+	endif()
 endif()
 
 # Linux system libraries. Threads is also needed on macOS by experiments_tests.
