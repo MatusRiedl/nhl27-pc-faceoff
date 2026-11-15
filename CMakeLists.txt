@@ -898,6 +898,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME graphics_small_formatted_image_sync
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --small-formatted-image-sync-only)
+	add_test(NAME graphics_partial_cp_copy
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --partial-cp-copy-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
