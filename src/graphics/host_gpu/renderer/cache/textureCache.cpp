@@ -1394,15 +1394,23 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
-		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
-		     " requested=%ux%u "
-		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
-		     requested.data.address, requested.resources.levels, requested.resources.layers,
-		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
-		     cached.info.data.size, static_cast<uint32_t>(requested.type),
-		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		// Same format, larger guest allocation and no expansion rule above applies: this used to EXIT. Treat it like
+		// the separate-layout case above (nhl24pc e8ca752): drop the old image when it is idle and let the requested
+		// one be created from guest memory.
+		static std::atomic<uint32_t> s_recreated {0};
+		if (const auto n = s_recreated.fetch_add(1, std::memory_order_relaxed); n < 16 || (n & (n - 1)) == 0) {
+			std::printf("NHL27OVERLAP recreate #%u address=0x%016" PRIx64 " requested=%ux%u cached=%ux%u "
+			            "requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64 " type=%u tile=%u/%u freed=%d\n",
+			            n + 1, requested.data.address, requested.resources.levels, requested.resources.layers,
+			            cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
+			            cached.info.data.size, static_cast<uint32_t>(requested.type),
+			            static_cast<uint32_t>(requested.tile_mode), static_cast<uint32_t>(cached.info.tile_mode),
+			            safe_to_delete ? 1 : 0);
+		}
+		if (safe_to_delete) {
+			FreeImage(cached_id);
+		}
+		return {merged_id};
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
