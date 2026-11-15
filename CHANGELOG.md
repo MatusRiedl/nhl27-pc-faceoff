@@ -2,6 +2,18 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
+## v0.10.1
+
+- 🩹 **Edit / Create Player no longer crashes** when you scroll through equipment. Thanks to the player who found it.
+  The cause was `KYTY_LAZY_SHARED_WRITES`, a speed-up from duy64's tree that every build since RC3 had on: a CPU write
+  next to memory the GPU had just written didn't wait for the GPU. It is now `"0"` in `builds/rc7/cfgGlobal.json`.
+  (Removing the line is not enough: the emulator turns it on when the line is missing.)
+- Same emulator as v0.10.0 otherwise. Faceoff 0.10.1 picks the new build and now checks the renamed repository
+  for updates.
+- **From v0.10.0:** Faceoff updates itself and the build. **From RC5:** Faceoff offers the new build; take
+  `Faceoff.exe` from the release once by hand. Saves and shader cache stay.
+- On an older build, set `"KYTY_LAZY_SHARED_WRITES": "0"` in that build's `cfgGlobal.json` to get the same fix.
+
 ## v0.10.0
 
 The project is now called **Faceoff**, and releases are numbered from v0.10.0 (this one is the former RC6).
