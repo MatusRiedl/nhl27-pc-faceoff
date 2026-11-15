@@ -186,6 +186,48 @@ void ApplyCpuSets(uint64_t mask) {
 #endif
 }
 
+// Logs every KYTY_* / NHL27* variable the process started with (Faceoff passes cfgGlobal.json "env" this way) and the
+// resulting experiment mask, so a shared play_log.txt says which switches ran. Values that may name a person, a path
+// or an address are logged as <set>.
+void PrintEnvironment(uint64_t mask) {
+	std::vector<std::string> vars;
+#if defined(_WIN32)
+	if (char* block = ::GetEnvironmentStringsA(); block != nullptr) {
+		for (const char* entry = block; *entry != '\0'; entry += std::strlen(entry) + 1) {
+			vars.emplace_back(entry);
+		}
+		::FreeEnvironmentStringsA(block);
+	}
+#else
+	extern char** environ;
+	for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+		vars.emplace_back(*entry);
+	}
+#endif
+	std::sort(vars.begin(), vars.end());
+	static constexpr std::array<const char*, 9> Private = {"ID", "ACCOUNT", "REDIRECT", "PATH", "DIR", "FILE",
+	                                                       "TOKEN", "KEY", "HOST"};
+	for (const auto& var: vars) {
+		if (!var.starts_with("KYTY_") && !var.starts_with("NHL27")) {
+			continue;
+		}
+		const auto eq   = var.find('=');
+		const auto name = var.substr(0, eq);
+		// Whole '_'-separated words only (WIDE must not match ID).
+		bool hide = false;
+		for (size_t begin = 0; begin <= name.size() && !hide;) {
+			const auto end  = std::min(name.find('_', begin), name.size());
+			const auto word = name.substr(begin, end - begin);
+			hide = std::any_of(Private.begin(), Private.end(), [&word](const char* p) { return word == p; });
+			begin = end + 1;
+		}
+		std::printf("NHL27ENV %s=%s\n", name.c_str(),
+		            eq == std::string::npos ? "" : (hide ? "<set>" : var.c_str() + eq + 1));
+	}
+	std::printf("NHL27ENV mask=0x%016" PRIx64 " cpus=%u\n", mask, std::thread::hardware_concurrency());
+	std::fflush(stdout);
+}
+
 struct State {
 	std::atomic<uint64_t>& mask = Detail::g_mask;
 
@@ -193,6 +235,7 @@ struct State {
 		const uint64_t defaults = EnvironmentMask();
 		mask.store(defaults, std::memory_order_relaxed);
 		ApplyCpuSets(defaults);
+		PrintEnvironment(defaults);
 		const char* path_env = std::getenv("KYTY_EXPERIMENT_FILE");
 		if (path_env == nullptr || path_env[0] == '\0') {
 			return;
