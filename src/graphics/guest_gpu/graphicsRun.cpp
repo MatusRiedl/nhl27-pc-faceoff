@@ -930,6 +930,7 @@ void GuestGpu::ExecutionThread() {
 		const auto long_before = long_ops ? std::optional(LongOpCounters::Take()) : std::nullopt;
 		if (auto* slot = operation->dispatch_slot; slot != nullptr) {
 			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const Common::HitchWhy::SlotWait hitch_slot;
 				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
 				                                         : std::chrono::steady_clock::time_point {};
 				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
@@ -948,6 +949,7 @@ void GuestGpu::ExecutionThread() {
 		}
 		if (auto* slot = operation->draw_slot; slot != nullptr) {
 			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const Common::HitchWhy::SlotWait hitch_slot;
 				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
 				                                         : std::chrono::steady_clock::time_point {};
 				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
@@ -1017,6 +1019,7 @@ void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
 	StageStats::t_role = StageStats::Role::Resolve;
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto operation = m_operations.TryPop();
@@ -1145,6 +1148,7 @@ void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
 void GuestGpu::DrawResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolveDraw");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::DrawResolve);
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto job = m_draw_jobs.Pop();
@@ -1163,6 +1167,7 @@ void GuestGpu::DrawResolveThread() {
 void GuestGpu::DispatchResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolveDispatch");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::DispatchResolve);
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto job = m_dispatch_jobs.Pop();

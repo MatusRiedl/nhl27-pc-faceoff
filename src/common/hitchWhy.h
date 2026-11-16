@@ -19,13 +19,24 @@
 // Printed for a frame over 40 ms, or over 22 ms while the game asks for 60 Hz (rate=0). chg = ms
 // since the flip rate last changed (left out after 5 s), flip = the longest gap between two flip
 // requests of the game inside the frame, d_idle / c_idle = how long the draw thread and the
-// command thread waited for work, d_rest = draw-thread time no span covers (the draws themselves).
+// command thread waited for work, d_slot = how long the draw thread waited for a resolve thread,
+// d_rest = draw-thread time nothing else covers (the draws themselves).
 // A cause reads self+wait+hop/count/max in ms: its own work, its waits for the GPU or the
 // scheduler, its waits for a command on the draw thread (on the draw thread itself: the command's
 // own run time), how many, and the longest one in full.
-// The prefix is the thread: d_ draw (execution) thread, c_ command thread, g_ every other thread
-// (the game's threads, compile workers). Times are exclusive: a span leaves out the spans inside
-// it, and a wait counts for the work it is inside, so the causes of one thread add up.
+// The prefix is the thread: d_ draw (execution) thread, c_ command thread, p_ the presenting
+// thread, q_ the scheduler's thread that waits for the GPU and then runs queued readbacks (a game
+// thread waiting for such a readback shows the same interval as its own wait), f_ the game thread
+// that asks for flips, r_ the resolve threads, g_ every other thread (the game's other threads,
+// compile workers). Times are exclusive: a span leaves out the spans inside it, and a wait counts
+// for the work it is inside, so the causes of one thread add up.
+//
+//   NHL27WHYSUM t=310.00 win=5.01 frames=300 slow=3 rate=0 mixed=0 dt=5010 d_idle=1200 d_slot=40
+//               d_rest=3600 c_idle=900 c_rest=3900 f_read=2.0+310.5+20.1/61/9.8 ...
+//
+// The same sums over every frame of about 5 s, slow or not (ms, max = the longest single one):
+// what a normal frame costs. mixed=1 when the flip rate changed inside. c_rest = command-thread
+// time nothing else covers.
 namespace Common::HitchWhy {
 
 enum class Cause : uint8_t {
@@ -48,7 +59,7 @@ enum class Kind : uint8_t {
 	Hop   // For a command to run on the draw thread.
 };
 
-enum class Role : uint8_t { Other, Draw, Cp, Count };
+enum class Role : uint8_t { Other, Draw, Cp, Present, Prio, Flip, Resolve, Count };
 
 [[nodiscard]] inline bool Enabled() noexcept {
 	static const bool on = [] {
@@ -68,6 +79,14 @@ namespace Detail {
 constexpr int Roles    = static_cast<int>(Role::Count);
 constexpr int Causes   = static_cast<int>(Cause::Count);
 constexpr int MaxDepth = 8;
+
+struct Line {
+	double   self  = 0.0;
+	double   wait  = 0.0;
+	double   hop   = 0.0;
+	double   max   = 0.0;
+	uint64_t count = 0;
+};
 
 struct Slot {
 	std::atomic<uint64_t> self_ns {0};
@@ -94,6 +113,7 @@ struct Stack {
 
 inline Slot                  g_slots[Roles][Causes];
 inline Idle                  g_idle[Roles];
+inline Idle                  g_draw_slot; // The draw thread waited for a resolve thread (one writer).
 inline std::atomic<uint64_t> g_flip_last_ns {0};
 inline std::atomic<uint64_t> g_flip_gap_ns {0};
 inline std::atomic<int>      g_rate {0};
@@ -118,6 +138,30 @@ inline void RaiseMax(std::atomic<uint64_t>& max, uint64_t value) noexcept {
 	auto previous = max.load(std::memory_order_relaxed);
 	while (previous < value && !max.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {
 	}
+}
+
+inline void AppendCauses(char* text, size_t size, size_t& used, const Line (&lines)[Roles][Causes], double least) noexcept {
+	static constexpr const char* role_names[Roles]   = {"g_", "d_", "c_", "p_", "q_", "f_", "r_"};
+	static constexpr const char* cause_names[Causes] = {"wait",    "fault", "read",   "unmap", "pipe",
+	                                                     "compile", "cwait", "urgent", "meta",  "io"};
+	for (int r = 0; r < Roles; r++) {
+		for (int c = 0; c < Causes; c++) {
+			const auto& line = lines[r][c];
+			if (line.self + line.wait + line.hop >= least) {
+				Append(text, size, used, " %s%s=%.1f+%.1f+%.1f/%llu/%.1f", role_names[r], cause_names[c], line.self, line.wait, line.hop,
+				       static_cast<unsigned long long>(line.count), line.max);
+			}
+		}
+	}
+}
+
+inline void Print(char* text, size_t size, size_t used) noexcept {
+	if (used >= size - 1) {
+		used = size - 2;
+	}
+	text[used]     = '\n';
+	text[used + 1] = '\0';
+	std::fputs(text, stdout);
 }
 } // namespace Detail
 
@@ -207,10 +251,30 @@ private:
 	Role     m_role;
 };
 
+// The draw thread waits for a resolve thread to finish an operation's inputs.
+class SlotWait final {
+public:
+	SlotWait() noexcept: m_start(Enabled() ? NowNs() : 0) {}
+	~SlotWait() {
+		if (m_start != 0) {
+			auto& slot = Detail::g_draw_slot.ns;
+			slot.store(slot.load(std::memory_order_relaxed) + (NowNs() - m_start), std::memory_order_relaxed);
+		}
+	}
+	SlotWait(const SlotWait&)            = delete;
+	SlotWait& operator=(const SlotWait&) = delete;
+
+private:
+	uint64_t m_start;
+};
+
 // The game asked for a flip.
 inline void NoteFlipRequest() noexcept {
 	if (!Enabled()) {
 		return;
+	}
+	if (Detail::t_stack.role == Role::Other) {
+		Detail::t_stack.role = Role::Flip;
 	}
 	const uint64_t now  = NowNs();
 	const uint64_t last = Detail::g_flip_last_ns.exchange(now, std::memory_order_relaxed);
@@ -225,28 +289,46 @@ inline void NoteRate(int rate) noexcept {
 	Detail::g_rate_change_ns.store(NowNs(), std::memory_order_relaxed);
 }
 
-// Once per presented frame, from the present thread only. t_s is the time NHL27HITCH prints.
+// Once per presented frame, from the presenting thread only. t_s is the time NHL27HITCH prints.
 inline void Frame(double t_s, double dt_ms) noexcept {
 	if (!Enabled()) {
 		return;
 	}
+	if (Detail::t_stack.role == Role::Other) {
+		Detail::t_stack.role = Role::Present;
+	}
+	using Detail::Line;
 	struct Seen {
 		uint64_t self, wait, hop, count;
 	};
-	struct Line {
-		double   self, wait, hop, max;
-		uint64_t count;
+	struct Window {
+		Line     lines[Detail::Roles][Detail::Causes];
+		double   idle[Detail::Roles];
+		double   slot, dt, start_s;
+		uint64_t start_ns;
+		int      frames, slow;
+		bool     open;
 	};
 	static Seen     seen[Detail::Roles][Detail::Causes] {};
 	static uint64_t seen_idle[Detail::Roles] {};
+	static uint64_t seen_slot = 0;
+	static Window   window {};
 	Line            lines[Detail::Roles][Detail::Causes];
 	double          idle_ms[Detail::Roles];
-	double          draw_ms = 0.0;
-	const auto      ms      = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	double          spans_ms[Detail::Roles] {};
+	const auto      ms     = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	const uint64_t  now_ns = NowNs();
+	if (!window.open) {
+		window          = Window {};
+		window.open     = true;
+		window.start_s  = t_s - dt_ms / 1000.0;
+		window.start_ns = now_ns;
+	}
 	for (int r = 0; r < Detail::Roles; r++) {
 		const uint64_t idle = Detail::g_idle[r].ns.load(std::memory_order_relaxed);
 		idle_ms[r]          = ms(idle - seen_idle[r]);
 		seen_idle[r]        = idle;
+		window.idle[r] += idle_ms[r];
 		for (int c = 0; c < Detail::Causes; c++) {
 			auto&      slot = Detail::g_slots[r][c];
 			auto&      was  = seen[r][c];
@@ -254,51 +336,70 @@ inline void Frame(double t_s, double dt_ms) noexcept {
 			                slot.hop_ns.load(std::memory_order_relaxed), slot.count.load(std::memory_order_relaxed)};
 			const uint64_t max =
 			    slot.max_ns.load(std::memory_order_relaxed) != 0 ? slot.max_ns.exchange(0, std::memory_order_relaxed) : 0;
-			lines[r][c] = {ms(now.self - was.self), ms(now.wait - was.wait), ms(now.hop - was.hop), ms(max),
-			               now.count - was.count};
-			was         = now;
-			if (r == static_cast<int>(Role::Draw)) {
-				draw_ms += lines[r][c].self + lines[r][c].wait + lines[r][c].hop;
-			}
+			auto& line = lines[r][c];
+			line       = {ms(now.self - was.self), ms(now.wait - was.wait), ms(now.hop - was.hop), ms(max), now.count - was.count};
+			was        = now;
+			spans_ms[r] += line.self + line.wait + line.hop;
+			auto& sum = window.lines[r][c];
+			sum.self += line.self;
+			sum.wait += line.wait;
+			sum.hop += line.hop;
+			sum.count += line.count;
+			sum.max = line.max > sum.max ? line.max : sum.max;
 		}
 	}
+	const uint64_t slot_ns = Detail::g_draw_slot.ns.load(std::memory_order_relaxed);
+	const double   slot_ms = ms(slot_ns - seen_slot);
+	seen_slot              = slot_ns;
 	const uint64_t flip_gap =
 	    Detail::g_flip_gap_ns.load(std::memory_order_relaxed) != 0 ? Detail::g_flip_gap_ns.exchange(0, std::memory_order_relaxed) : 0;
-	const int      rate     = Detail::g_rate.load(std::memory_order_relaxed);
-	if (dt_ms <= (rate == 0 ? 22.0 : 40.0)) {
-		return;
-	}
-	static constexpr const char* role_names[Detail::Roles]   = {"g_", "d_", "c_"};
-	static constexpr const char* cause_names[Detail::Causes] = {"wait",    "fault", "read",   "unmap", "pipe",
-	                                                             "compile", "cwait", "urgent", "meta",  "io"};
-	char   text[1536];
+	const int      rate    = Detail::g_rate.load(std::memory_order_relaxed);
+	const uint64_t changed = Detail::g_rate_change_ns.load(std::memory_order_relaxed);
+	const bool     slow    = dt_ms > (rate == 0 ? 22.0 : 40.0);
+	const int      draw    = static_cast<int>(Role::Draw);
+	const int      cp      = static_cast<int>(Role::Cp);
+	window.slot += slot_ms;
+	window.dt += dt_ms;
+	window.frames++;
+	window.slow += slow ? 1 : 0;
+	char   text[4096];
 	size_t used = 0;
-	const double draw_idle = idle_ms[static_cast<int>(Role::Draw)];
-	const double rest      = dt_ms - draw_idle - draw_ms;
-	Detail::Append(text, sizeof(text), used, "NHL27HITCHWHY t=%.2f dt=%.1fms rate=%d", t_s, dt_ms, rate);
-	if (const uint64_t changed = Detail::g_rate_change_ns.load(std::memory_order_relaxed); changed != 0) {
-		const double since = ms(NowNs() - changed);
-		if (since < 5000.0) {
-			Detail::Append(text, sizeof(text), used, " chg=%.0f", since);
-		}
-	}
-	Detail::Append(text, sizeof(text), used, " flip=%.1f d_idle=%.1f c_idle=%.1f d_rest=%.1f", ms(flip_gap), draw_idle, idle_ms[static_cast<int>(Role::Cp)],
-	    rest > 0.0 ? rest : 0.0);
-	for (int r = 0; r < Detail::Roles; r++) {
-		for (int c = 0; c < Detail::Causes; c++) {
-			const auto& line = lines[r][c];
-			if (line.self + line.wait + line.hop >= 0.1) {
-				Detail::Append(text, sizeof(text), used, " %s%s=%.1f+%.1f+%.1f/%llu/%.1f", role_names[r], cause_names[c], line.self, line.wait, line.hop,
-				    static_cast<unsigned long long>(line.count), line.max);
+	if (slow) {
+		// A wait is booked when it ends, so one that began in an earlier frame is cut to this frame.
+		const double draw_idle = idle_ms[draw] < dt_ms ? idle_ms[draw] : dt_ms;
+		const double cp_idle   = idle_ms[cp] < dt_ms ? idle_ms[cp] : dt_ms;
+		const double rest      = dt_ms - draw_idle - slot_ms - spans_ms[draw];
+		Detail::Append(text, sizeof(text), used, "NHL27HITCHWHY t=%.2f dt=%.1fms rate=%d", t_s, dt_ms, rate);
+		if (changed != 0) {
+			const double since = ms(now_ns - changed);
+			if (since < 5000.0) {
+				Detail::Append(text, sizeof(text), used, " chg=%.0f", since);
 			}
 		}
+		Detail::Append(text, sizeof(text), used, " flip=%.1f d_idle=%.1f c_idle=%.1f d_slot=%.1f d_rest=%.1f", ms(flip_gap), draw_idle, cp_idle,
+		               slot_ms, rest > 0.0 ? rest : 0.0);
+		Detail::AppendCauses(text, sizeof(text), used, lines, 0.1);
+		Detail::Print(text, sizeof(text), used);
 	}
-	if (used >= sizeof(text) - 1) {
-		used = sizeof(text) - 2;
+	if (t_s - window.start_s >= 5.0) {
+		double draw_spans = 0.0;
+		double cp_spans   = 0.0;
+		for (int c = 0; c < Detail::Causes; c++) {
+			draw_spans += window.lines[draw][c].self + window.lines[draw][c].wait + window.lines[draw][c].hop;
+			cp_spans += window.lines[cp][c].self + window.lines[cp][c].wait + window.lines[cp][c].hop;
+		}
+		const double draw_rest = window.dt - window.idle[draw] - window.slot - draw_spans;
+		const double cp_rest   = window.dt - window.idle[cp] - cp_spans;
+		used                   = 0;
+		Detail::Append(text, sizeof(text), used,
+		               "NHL27WHYSUM t=%.2f win=%.2f frames=%d slow=%d rate=%d mixed=%d dt=%.0f d_idle=%.0f d_slot=%.0f d_rest=%.0f c_idle=%.0f "
+		               "c_rest=%.0f",
+		               t_s, t_s - window.start_s, window.frames, window.slow, rate, changed >= window.start_ns ? 1 : 0, window.dt,
+		               window.idle[draw], window.slot, draw_rest > 0.0 ? draw_rest : 0.0, window.idle[cp], cp_rest > 0.0 ? cp_rest : 0.0);
+		Detail::AppendCauses(text, sizeof(text), used, window.lines, 1.0);
+		Detail::Print(text, sizeof(text), used);
+		window.open = false;
 	}
-	text[used]     = '\n';
-	text[used + 1] = '\0';
-	std::fputs(text, stdout);
 }
 
 } // namespace Common::HitchWhy

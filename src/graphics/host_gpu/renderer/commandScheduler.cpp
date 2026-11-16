@@ -1405,6 +1405,7 @@ void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Prio);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
