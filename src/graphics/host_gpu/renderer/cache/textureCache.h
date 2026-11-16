@@ -178,6 +178,27 @@ private:
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
+	// Registered images per page of the image page table. Written under m_lock, read without it
+	// by InvalidateMemory (upstream 4f9d51dd). The leaf table is on the heap: 128 KiB, and tests
+	// build the RenderContext that holds this cache on the stack.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts();
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t kLeafBits = 10;
+		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
+		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
+		using Table = std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize>;
+
+		std::unique_ptr<Table> m_leaves;
+	};
+
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
@@ -283,6 +304,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	// Registered images by exact start address (FindImage fast path).
 	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
 	std::atomic<uint64_t>                              m_address_index_version {0};
