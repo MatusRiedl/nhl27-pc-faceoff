@@ -838,6 +838,48 @@ void TestFlexibleMemoryUsesSharedBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// The merge of a lazy shared-page download: what the CPU stored since the snapshot stays (a whole
+// aligned dword with any changed byte, a single byte at the unaligned ends); the rest takes the
+// GPU's bytes. A refused merge (no backing) changes nothing.
+void TestMergeBackingKeepsCpuBytes() {
+	const char* test    = "MergeBackingKeepsCpuBytes";
+	void*       address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(&address, SceKernelPageSize, SceKernelProtCpuRw, 0,
+	                                                              "merge_backing"),
+	        "KernelMapNamedFlexibleMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	auto*      view = reinterpret_cast<uint8_t*>(address);
+
+	constexpr size_t     Size = 21; // 3 head bytes, 4 aligned dwords, 2 tail bytes (started one byte in)
+	std::vector<uint8_t> before(Size), gpu(Size);
+	for (size_t i = 0; i < Size; i++) {
+		before[i] = static_cast<uint8_t>(0x10 + i);
+		gpu[i]    = static_cast<uint8_t>(0xa0 + i);
+	}
+	std::memcpy(view + 1, before.data(), Size);
+	// The CPU stores while the download is pending: one head byte, one byte inside the first aligned
+	// dword (offsets 3-6), one tail byte.
+	view[1 + 1]  = 0x55;
+	view[1 + 4]  = 0x66;
+	view[1 + 20] = 0x77;
+	Check(test, Libs::LibKernel::Memory::TryMergeBacking(base + 1, gpu.data(), before.data(), Size),
+	      "TryMergeBacking refused a mapped range");
+	for (size_t i = 0; i < Size; i++) {
+		const uint8_t want = i == 1    ? 0x55
+		                     : i == 4  ? 0x66
+		                     : i == 20 ? 0x77
+		                     : i >= 3 && i <= 6 ? before[i]
+		                                        : gpu[i];
+		Check(test, view[1 + i] == want, "merge left a wrong byte");
+	}
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	const uint8_t one = 0xee;
+	Check(test, !Libs::LibKernel::Memory::TryMergeBacking(base, &one, &one, 1),
+	      "TryMergeBacking accepted memory without backing");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleDmemCompatAndAlignmentFlags() {
 	const char* test     = "FlexibleDmemCompatAndAlignmentFlags";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -4925,6 +4967,7 @@ int main(int argc, char** argv) {
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+		RunTest(TestMergeBackingKeepsCpuBytes);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #if defined(__linux__)
@@ -4985,6 +5028,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+	RunTest(TestMergeBackingKeepsCpuBytes);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);

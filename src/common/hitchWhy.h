@@ -118,6 +118,7 @@ inline std::atomic<uint64_t> g_flip_last_ns {0};
 inline std::atomic<uint64_t> g_flip_gap_ns {0};
 inline std::atomic<int>      g_rate {0};
 inline std::atomic<uint64_t> g_rate_change_ns {0};
+inline std::atomic<uint64_t> g_left_play_ns {0}; // When the rate last went from 60 Hz to a lower one.
 inline thread_local Stack    t_stack {};
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -285,8 +286,35 @@ inline void NoteFlipRequest() noexcept {
 
 // The game changed the flip rate it asks for (0 = 60 Hz, 1 = 30 Hz).
 inline void NoteRate(int rate) noexcept {
-	Detail::g_rate.store(rate, std::memory_order_relaxed);
-	Detail::g_rate_change_ns.store(NowNs(), std::memory_order_relaxed);
+	const auto now      = NowNs();
+	const int  previous = Detail::g_rate.exchange(rate, std::memory_order_relaxed);
+	if (previous == 0 && rate != 0) {
+		Detail::g_left_play_ns.store(now, std::memory_order_relaxed);
+	}
+	Detail::g_rate_change_ns.store(now, std::memory_order_relaxed);
+}
+
+// The flip rate the game asks for now (0 = 60 Hz: play; NHL 27 runs menus, editors and scenes at
+// 30 Hz). Kept whether or not the hitch line is on. Any thread.
+[[nodiscard]] inline int Rate() noexcept {
+	return Detail::g_rate.load(std::memory_order_relaxed);
+}
+
+// Whether the game asks for 60 Hz, or stopped doing so less than hold_ms ago. Any thread.
+// False until the game first set a flip rate (boot screens).
+[[nodiscard]] inline bool InPlay(uint64_t hold_ms = 0) noexcept {
+	if (Detail::g_rate_change_ns.load(std::memory_order_relaxed) == 0) {
+		return false;
+	}
+	if (Rate() == 0) {
+		return true;
+	}
+	if (hold_ms == 0) {
+		return false;
+	}
+	const auto left = Detail::g_left_play_ns.load(std::memory_order_relaxed);
+	const auto now  = NowNs();
+	return left != 0 && now >= left && now - left < hold_ms * 1000000ull;
 }
 
 // Once per presented frame, from the presenting thread only. t_s is the time NHL27HITCH prints.
