@@ -1994,6 +1994,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        {}, 1, &copied, 0, nullptr, 0, nullptr);
 	}
 	vertex_section.Stop();
+	// Upstream PR 2224: bind the shader buffers only after the draw inputs. The vertex, index and
+	// indirect argument lookups can join cache buffers, which retires the buffers RebindBuffers had
+	// just picked, and the draw then wrote its storage buffers through the old handles.
+	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
+	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	{
+		BufferCache::PerfTimerScope rebind_section(BufferCache::PerfTimer::DrawBindResolve);
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		FrameBreakdown::Timer rebind_timer(FrameBreakdown::g_counters.dp_rebind_ns);
+		for (auto* stage: stages) {
+			RebindBuffers(*stage);
+		}
+	}
 	BufferCache::PerfTimerScope pipeline_section(BufferCache::PerfTimer::DrawPipeline);
 	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
 	std::optional<FrameBreakdown::Timer> pipeline_timer;
