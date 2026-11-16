@@ -2429,6 +2429,21 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+// NHL27PIPEFIRST: a pipeline built on the execution thread at first use (the store did not have it),
+// with how long the driver took. Printed for the first 200 per session; costs nothing per draw.
+void PipelineCache::LogFirstUse(const char* kind, std::chrono::steady_clock::time_point begin,
+                                uint64_t first_id, uint64_t second_id) {
+	static std::atomic<uint32_t> printed {0};
+	if (printed.fetch_add(1, std::memory_order_relaxed) >= 200) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	const auto ms  = std::chrono::duration<double, std::milli>(now - begin).count();
+	std::printf("NHL27PIPEFIRST kind=%s ms=%.1f ids=%llu,%llu\n", kind, ms,
+	            static_cast<unsigned long long>(first_id), static_cast<unsigned long long>(second_id));
+	std::fflush(stdout);
+}
+
 void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
@@ -3454,6 +3469,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto first_use_begin = std::chrono::steady_clock::now();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -3461,6 +3477,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache);
 	}
+	LogFirstUse("graphics", first_use_begin, vs_id, ps_id);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
@@ -3498,7 +3515,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<Pipeline>();
+	auto       cached          = std::make_unique<Pipeline>();
+	const auto first_use_begin = std::chrono::steady_clock::now();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -3506,6 +3524,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
 		                       m_driver_cache);
 	}
+	LogFirstUse("compute", first_use_begin, compute_program.id, 0);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 

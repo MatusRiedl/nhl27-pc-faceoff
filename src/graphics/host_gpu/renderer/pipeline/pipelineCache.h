@@ -361,6 +361,8 @@ private:
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
 	void WriteDriverCache();
 	void CheckpointDriverCache();
+	void LogFirstUse(const char* kind, std::chrono::steady_clock::time_point begin, uint64_t first_id,
+	                 uint64_t second_id);
 
 };
 
