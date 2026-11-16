@@ -2625,7 +2625,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	ImageId  image {};
 	uint64_t end               = vaddr + size;
 	bool     written_past_read = false;
-	if (texel_candidate) {
+	// texel_read already proved that no image starts at vaddr (HasImageAt, or a memo answer at
+	// an unchanged registration version), and only such an image is found: skip the lookup.
+	if (texel_candidate && !texel_read) {
 		image = m_texture_cache.FindImageFromRange(vaddr, size);
 	}
 	if (image) {
@@ -2704,7 +2706,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .image_version = image_version};
 	}
 	if (is_written || is_texel_buffer) {
-		DropGpuFills(vaddr, size);
+		// An image download writes the buffer up to the image end, past a grown read.
+		DropGpuFills(vaddr, synced_from_image ? end - vaddr : size);
 	}
 	if (is_written) {
 		buffer.last_write_tick = m_scheduler.CurrentTick();
