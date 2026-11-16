@@ -1892,6 +1892,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		     vaddr, size);
 	}
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Read);
 	// The pipelined command processor counts as the GPU: its faults (PM4 and register data next to
 	// GPU-written bytes) are served after the operations it emitted, and the sync download waits
 	// only for the writer's submission (KYTY_READBACK_QUEUE). The asynchronous guest-read path

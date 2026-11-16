@@ -1154,8 +1154,13 @@ static void TrackPresentInterval(const GraphicContext& graphics) {
 	const float               dt = std::chrono::duration<float, std::milli>(now - last).count();
 	last                         = now;
 	window_ms.push_back(dt);
+	const double ticks_s = static_cast<double>(SDL_GetTicks()) / 1000.0;
 	if (dt > 40.0f) {
-		std::printf("NHL27HITCH t=%.2f dt=%.1fms\n", static_cast<double>(SDL_GetTicks()) / 1000.0, static_cast<double>(dt));
+		std::printf("NHL27HITCH t=%.2f dt=%.1fms\n", ticks_s, static_cast<double>(dt));
+	}
+	// NHL27HITCHWHY: where the time of a slow frame went (common/hitchWhy.h).
+	Common::HitchWhy::Frame(ticks_s, static_cast<double>(dt));
+	if (dt > 40.0f) {
 		std::fflush(stdout);
 	}
 	if (now - window_begin < std::chrono::seconds(5)) {

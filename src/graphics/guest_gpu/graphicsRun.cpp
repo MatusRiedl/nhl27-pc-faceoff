@@ -255,6 +255,7 @@ void GuestGpu::ProcessCommands() {
 
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
+	const Common::HitchWhy::Span hitch_hop(Common::HitchWhy::Kind::Hop);
 	if (IsGpuThread()) {
 		command();
 		return;
@@ -278,6 +279,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
+	const Common::HitchWhy::Span hitch_hop(Common::HitchWhy::Kind::Hop);
 	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
 		SendCommandSync(std::move(command));
 		return;
@@ -301,6 +303,7 @@ void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Urgent);
 	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
 	// Unmaps free memory that copies of executed draws may still read.
 	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
@@ -881,6 +884,7 @@ void GuestGpu::ExecutionThread() {
 	StageStats::t_role = StageStats::Role::Execution;
 	g_gpu_thread    = true;
 	g_execution_gpu = this;
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Draw);
 	RegionManager::MarkGpuOrderedThread();
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
@@ -899,11 +903,15 @@ void GuestGpu::ExecutionThread() {
 			if (StageStats::Enabled()) {
 				const auto start = std::chrono::steady_clock::now();
 				const auto cause = StageStats::ExecIdleCause();
-				operation        = operations.Pop();
+				{
+					const Common::HitchWhy::IdleScope hitch_idle(Common::HitchWhy::Role::Draw);
+					operation = operations.Pop();
+				}
 				StageStats::Add(StageStats::ExecIdle, start);
 				StageStats::Add(cause, start);
 				PrintStageStats();
 			} else {
+				const Common::HitchWhy::IdleScope hitch_idle(Common::HitchWhy::Role::Draw);
 				operation = operations.Pop();
 			}
 			Common::EventTrace::Record(Common::EventTrace::EXEC_WAIT_END);
@@ -2035,6 +2043,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = !gpu->m_pipelined;
 	g_cp_thread  = gpu->m_pipelined;
+	Common::HitchWhy::SetRole(gpu->m_pipelined ? Common::HitchWhy::Role::Cp : Common::HitchWhy::Role::Draw);
 	RegionManager::MarkGpuOrderedThread();
 	g_gpu_state  = gpu;
 	if (gpu->m_pipelined) {
@@ -2136,9 +2145,12 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				Common::EventTrace::Record(Common::EventTrace::GPU_WAIT_END,
 				                           gpu->m_commands.size() + gpu->m_submission_count);
-				FrameBreakdown::AddIdleGap(static_cast<uint64_t>(
+				const auto idle_ns = static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idle_start)
-				        .count()));
+				        .count());
+				FrameBreakdown::AddIdleGap(idle_ns);
+				Common::HitchWhy::AddIdle(gpu->m_pipelined ? Common::HitchWhy::Role::Cp : Common::HitchWhy::Role::Draw,
+				                          idle_ns);
 				Common::Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
