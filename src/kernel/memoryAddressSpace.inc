@@ -975,7 +975,18 @@ public:
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
+		::Libs::Graphics::NvxSelfTest("M2_prereserve");
 		ReserveGuestRegions();
+		{
+			uint64_t owned = 0;
+			for (const auto& region: m_owned) {
+				owned += region.second;
+			}
+			std::printf("NHL27GUESTVA owned_regions=%zu owned_mib=%llu\n", m_owned.size(),
+			            static_cast<unsigned long long>(owned >> 20u));
+			std::fflush(stdout);
+		}
+		::Libs::Graphics::NvxSelfTest("M3_reserved");
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

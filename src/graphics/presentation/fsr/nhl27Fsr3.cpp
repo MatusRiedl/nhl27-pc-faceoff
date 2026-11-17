@@ -799,6 +799,30 @@ struct Nhl27Fsr3::Impl {
 		signal.AddSignal(dlss_bridge->Semaphore(), inputs_ready);
 		scheduler.Flush(signal);
 		InvalidateRedundantBinds();
+		{
+			// The bridge submits straight to the queue and waits there for inputs_ready. With deferred
+			// recording the recording thread may not have handed the submission that signals it to the
+			// queue yet, and a wait queued ahead of its signal on the same queue can stall the GPU.
+			// KYTY_DLSS_WAIT_SUBMITTED=0 skips the wait (diagnostic).
+			static const bool wait_submitted = [] {
+				const char* value = std::getenv("KYTY_DLSS_WAIT_SUBMITTED");
+				return value == nullptr || value[0] != '0';
+			}();
+			const uint64_t tick  = scheduler.CurrentTick() - 1;
+			const auto     start = std::chrono::steady_clock::now();
+			if (wait_submitted) {
+				scheduler.WaitSubmitted(tick);
+			}
+			if (dlss_frames < 24) {
+				const auto waited =
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+				std::printf("NHL27DLSS order frame=%llu inputs_ready=%llu tick=%llu waited_us=%lld wait_submitted=%d\n",
+				            static_cast<unsigned long long>(dlss_frames + 1),
+				            static_cast<unsigned long long>(inputs_ready), static_cast<unsigned long long>(tick),
+				            static_cast<long long>(waited.count()), wait_submitted ? 1 : 0);
+				std::fflush(stdout);
+			}
+		}
 		DlssParams params {};
 		params.jitter_x = frame.jitter_x;
 		params.jitter_y = frame.jitter_y;
@@ -848,6 +872,12 @@ struct Nhl27Fsr3::Impl {
 		wait.AddWait(dlss_bridge->Semaphore(), upscaled);
 		scheduler.Flush(wait);
 		InvalidateRedundantBinds();
+		if (dlss_frames < 24) {
+			std::printf("NHL27DLSS order frame=%llu after-flush tick=%llu\n",
+			            static_cast<unsigned long long>(dlss_frames + 1),
+			            static_cast<unsigned long long>(scheduler.CurrentTick() - 1));
+			std::fflush(stdout);
+		}
 		if (!ok) ++dlss_failed;
 		++dlss_frames;
 		return true;
