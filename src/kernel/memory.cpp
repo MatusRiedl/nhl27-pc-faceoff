@@ -55,6 +55,11 @@
 #include <unistd.h>
 #endif
 
+namespace Libs::Graphics {
+void NvxSelfTest(const char* where);
+void DlssWarmUp();
+} // namespace Libs::Graphics
+
 namespace Libs::LibKernel::Memory {
 
 namespace VirtualMemory = Common::VirtualMemory;
@@ -1603,13 +1608,19 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
+	::Libs::Graphics::NvxSelfTest("M1_vm");
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	::Libs::Graphics::NvxSelfTest("M4_space");
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
+	::Libs::Graphics::NvxSelfTest("M5_phys");
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
+	::Libs::Graphics::NvxSelfTest("M6_ranges");
 	EXIT_IF(!g_guest_address_space->SelfTest());
+	::Libs::Graphics::NvxSelfTest("M7_selftest");
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+	::Libs::Graphics::NvxSelfTest("M8_alias");
 }
 
 void Shutdown() {

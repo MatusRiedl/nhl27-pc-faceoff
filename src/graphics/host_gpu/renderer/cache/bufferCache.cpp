@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/cache/readbackWindow.h"
 #include "graphics/host_gpu/pageWriteSeq.h"
 #include "common/experiments.h"
+#include "common/hitchWhy.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1082,6 +1083,29 @@ struct ReadbackWaitNote {
 };
 } // namespace
 
+// A merge is refused as a whole when any byte of its range has no backing, where a plain publish
+// skips such gaps (TryWriteBacking). The merge does the same here in 4 KiB steps; it used to exit
+// the emulator. Every async download merges (lazy writes on or off), so this applies to both.
+static void MergeBackedPages(uint64_t address, const uint8_t* gpu, const uint8_t* expected, uint64_t bytes) {
+	constexpr uint64_t Page    = 0x1000;
+	const auto         end     = address + bytes;
+	uint64_t           skipped = 0;
+	for (auto at = address; at < end;) {
+		const auto part = std::min(end, (at + Page) & ~(Page - 1)) - at;
+		if (!Libs::LibKernel::Memory::TryMergeBacking(at, gpu + (at - address), expected + (at - address), part)) {
+			skipped += part;
+		}
+		at += part;
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("NHL27MERGESKIP: download 0x%016llx+0x%llx: %llu bytes without backing left out\n",
+		            static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes),
+		            static_cast<unsigned long long>(skipped));
+		std::fflush(stdout);
+	}
+}
+
 template <bool async, bool merge>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	static_assert(async || !merge);
@@ -1254,7 +1278,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 				    if (expected != nullptr) {
 					    // Bytes the CPU stored since the download was queued are newer than the GPU's.
 					    if (!Libs::LibKernel::Memory::TryMergeBacking(address, gpu + skip, expected + skip, bytes)) {
-						    EXIT("BufferCache: merge of a shared-page download failed\n");
+						    MergeBackedPages(address, gpu + skip, expected + skip, bytes);
 					    }
 				    } else {
 					    Libs::LibKernel::Memory::WriteBacking(address, gpu + skip, bytes);
@@ -1634,6 +1658,24 @@ static bool SharedWritesDebug() {
 	return enabled;
 }
 
+// Where a lazy shared write may be taken. One player's game crashed in the Edit / Create Player
+// screens (30 Hz) while scrolling through equipment with lazy writes on, and stopped crashing with
+// them off; the crash was never reproduced and left no log. So by default only play (the game asks
+// for 60 Hz) takes them, and every 30 Hz screen waits for the GPU as with the switch off.
+// KYTY_LAZY_SHARED_WRITES_RATES=all: at any rate, as every build up to v0.10.0 did.
+// KYTY_LAZY_SHARED_WRITES_HOLD_MS=<n>: also for n ms after the game left 60 Hz (replays).
+static bool LazySharedWriteRateOk() {
+	static const bool all_rates = [] {
+		const char* value = std::getenv("KYTY_LAZY_SHARED_WRITES_RATES");
+		return value != nullptr && std::strcmp(value, "all") == 0;
+	}();
+	static const uint64_t hold_ms = [] {
+		const char* value = std::getenv("KYTY_LAZY_SHARED_WRITES_HOLD_MS");
+		return value != nullptr ? std::min<uint64_t>(std::strtoull(value, nullptr, 10), 600000) : 0;
+	}();
+	return all_rates || Common::HitchWhy::InPlay(hold_ms);
+}
+
 bool BufferCache::LazySharedWriteEligible(uint64_t vaddr, uint64_t size) {
 	// The stored bytes must not be GPU-written themselves, and the GPU must own only a few bytes
 	// of each page involved.
@@ -1892,6 +1934,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		     vaddr, size);
 	}
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Read);
 	// The pipelined command processor counts as the GPU: its faults (PM4 and register data next to
 	// GPU-written bytes) are served after the operations it emitted, and the sync download waits
 	// only for the writer's submission (KYTY_READBACK_QUEUE). The asynchronous guest-read path
@@ -1995,7 +2038,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			// changes meanwhile, which are newer.
 			const bool lazy = is_write && !on_gpu &&
 			                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
-			                  LazySharedWriteEligible(vaddr, size);
+			                  LazySharedWriteRateOk() && LazySharedWriteEligible(vaddr, size);
 			if (CpReadDebugEnabled()) {
 				g_readback_origin = origin;
 				g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
@@ -2171,11 +2214,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 					            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
 				}
 			}
-			if (downloaded) {
+			// A write hands its own pages from the GPU to the CPU in one critical section
+			// (TakeGpuPagesForCpu, upstream PR 1412), also when nothing was downloaded. The rest of a
+			// widened download window (WideWriteDownloads, KYTY_READBACK_WINDOW_KIB) is released here;
+			// releasing the write's pages twice is harmless, the second release is the atomic one.
+			if (downloaded && !(is_write && download_vaddr == vaddr && download_size == size)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
 			}
 			if (is_write) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				m_memory_tracker.TakeGpuPagesForCpu(vaddr, size);
 			}
 		});
 		if (split) {
@@ -2402,7 +2449,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    ImageId image) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -2463,9 +2510,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
+	if (image) {
 		FrameBreakdown::Timer image_timer(bs.sb_image_ns[bi], bon);
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+		return SynchronizeBufferFromImage(buffer, image);
 	}
 	return false;
 }
@@ -2612,9 +2659,36 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// A formatted read that starts at a GPU-written image gets a buffer over the whole image, so
+	// SynchronizeBufferFromImage can download every level. A buffer over only the read misses the
+	// levels past it: a read smaller than level 0 kept the stale guest bytes, and so did a later
+	// read of the rest of the image (upstream PR 2193). The buffer is not grown over bytes past the
+	// read that the GPU wrote as buffer data, which the download would overwrite. The image is
+	// looked up once here, where SynchronizeBuffer used to look it up again.
+	ImageId  image {};
+	uint64_t end               = vaddr + size;
+	bool     written_past_read = false;
+	// texel_read already proved that no image starts at vaddr (HasImageAt, or a memo answer at
+	// an unchanged registration version), and only such an image is found: skip the lookup.
+	if (texel_candidate && !texel_read) {
+		image = m_texture_cache.FindImageFromRange(vaddr, size);
+	}
+	if (image) {
+		const auto image_end = [&] {
+			std::scoped_lock lock {m_texture_cache.m_lock};
+			const auto&      range = m_texture_cache.m_slot_images[image].info.data;
+			// A stencil read resolves to its depth image, which starts elsewhere: no growth.
+			return range.address == vaddr ? range.End() : end;
+		}();
+		if (image_end > end) {
+			written_past_read = m_memory_tracker.IsRegionGpuModified(end, image_end - end);
+			end               = written_past_read ? end : image_end;
+		}
+	}
+	// The stream buffer copies guest bytes, which are stale under a GPU-written image.
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && (!image || written_past_read)) {
 		// Draws stream the same small buffers (frame and pass constants) again and again. Within
 		// a draw window the guest cannot have written them since the last copy, so draws share it
 		// while it is in the stream buffer and no work wrote cached buffers.
@@ -2647,10 +2721,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
 		FrameBreakdown::Timer find_timer(bs.ob_find_ns, bon);
 		if (bon) bs.ob_find_calls.fetch_add(1, std::memory_order_relaxed);
-		id = FindBuffer(vaddr, size);
+		id = FindBuffer(vaddr, end - vaddr);
 	}
 	auto& buffer = m_slot_buffers[id];
 	{
@@ -2661,7 +2735,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	{
 		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
 		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
-		synced_from_image = SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+		synced_from_image = SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
 	}
 	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
 	if (plain_read || (texel_read && !synced_from_image)) {
@@ -2675,7 +2749,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .image_version = image_version};
 	}
 	if (is_written || is_texel_buffer) {
-		DropGpuFills(vaddr, size);
+		// An image download writes the buffer up to the image end, past a grown read.
+		DropGpuFills(vaddr, synced_from_image ? end - vaddr : size);
 	}
 	if (is_written) {
 		buffer.last_write_tick = m_scheduler.CurrentTick();
@@ -2842,7 +2917,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
-			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, {});
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
@@ -2886,7 +2961,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	m_texture_cache.PrepareBufferWrite(vaddr, size);
 	SetWriterTag("fill", 0);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
@@ -2922,7 +2997,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto& command = m_scheduler.Current();
 	SetWriterTag("copy", 0);
 	if (dst_memory) {
-		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+		m_texture_cache.PrepareBufferWrite(dst_vaddr, size);
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
@@ -3388,7 +3463,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			const auto start  = std::max(buffer.CpuAddress(), span);
 			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 			if (start < finish) {
-				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, {});
 			}
 		}
 	});
@@ -3432,7 +3507,7 @@ bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, const
 				    const auto start  = std::max(buffer.CpuAddress(), span);
 				    const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 				    if (start < finish) {
-					    (void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+					    (void)SynchronizeBuffer(buffer, start, finish - start, false, {});
 				    }
 			    }
 		    });

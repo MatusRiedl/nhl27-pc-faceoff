@@ -128,6 +128,11 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// Before a CP DMA copy or fill writes [address, address + size) through the buffer cache:
+	// every image the range overlaps re-uploads from the buffer. A GPU-written image the write
+	// covers only in part first publishes its texels into the buffer, so its other texels survive.
+	// Images that cannot be read back keep the base-address rule of InvalidateMemoryFromGPU.
+	void               PrepareBufferWrite(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
@@ -172,6 +177,27 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+
+	// Registered images per page of the image page table. Written under m_lock, read without it
+	// by InvalidateMemory (upstream 4f9d51dd). The leaf table is on the heap: 128 KiB, and tests
+	// build the RenderContext that holds this cache on the stack.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts();
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t kLeafBits = 10;
+		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
+		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
+		using Table = std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize>;
+
+		std::unique_ptr<Table> m_leaves;
+	};
 
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
@@ -278,6 +304,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	// Registered images by exact start address (FindImage fast path).
 	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
 	std::atomic<uint64_t>                              m_address_index_version {0};

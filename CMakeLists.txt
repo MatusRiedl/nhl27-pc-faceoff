@@ -430,6 +430,43 @@ if(KYTY_ENABLE_FSR4)
 	endif()
 endif()
 
+# NHL 27 DLSS bridge (opt-in): links the NGX SDK import library; the release DLL ships
+# next to the exe, where NGX Core (in the driver) looks for it first. Only the rel DLL
+# may be distributed (the dev DLL is prohibited from public releases by the SDK license).
+option(KYTY_ENABLE_DLSS "Build the NHL 27 DLSS D3D12 bridge (needs DLSS_SDK_DIR)" OFF)
+set(DLSS_SDK_DIR "" CACHE PATH "Path to the NVIDIA DLSS SDK (NVIDIA/DLSS)")
+if(KYTY_ENABLE_DLSS)
+	if(NOT EXISTS "${DLSS_SDK_DIR}/include/nvsdk_ngx.h" OR NOT EXISTS "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib" OR NOT EXISTS "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll")
+		message(FATAL_ERROR "KYTY_ENABLE_DLSS needs DLSS_SDK_DIR pointing at an NVIDIA DLSS SDK checkout")
+	endif()
+	include_directories(SYSTEM "${DLSS_SDK_DIR}/include")
+	add_compile_definitions(KYTY_ENABLE_DLSS=1)
+	list(APPEND kyty_emulator_link_libraries "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+	install(FILES "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" DESTINATION .)
+	if(EXISTS "${DLSS_SDK_DIR}/LICENSE.txt")
+		install(FILES "${DLSS_SDK_DIR}/LICENSE.txt" DESTINATION licenses/DLSS-SDK)
+	endif()
+endif()
+
+# NHL 27 XeSS bridge (opt-in): the SDK headers are used for types only; libxess.dll is
+# loaded at runtime (like the FSR 4 bridge loads AMD's loader DLL), so nothing is linked.
+option(KYTY_ENABLE_XESS "Build the NHL 27 XeSS D3D12 bridge (needs XESS_SDK_DIR)" OFF)
+set(XESS_SDK_DIR "" CACHE PATH "Path to the Intel XeSS SDK (intel/xess)")
+if(KYTY_ENABLE_XESS)
+	if(NOT EXISTS "${XESS_SDK_DIR}/inc/xess/xess_d3d12.h" OR NOT EXISTS "${XESS_SDK_DIR}/bin/libxess.dll")
+		message(FATAL_ERROR "KYTY_ENABLE_XESS needs XESS_SDK_DIR pointing at an Intel XeSS SDK checkout")
+	endif()
+	include_directories(SYSTEM "${XESS_SDK_DIR}/inc")
+	add_compile_definitions(KYTY_ENABLE_XESS=1)
+	install(FILES "${XESS_SDK_DIR}/bin/libxess.dll" DESTINATION .)
+	if(EXISTS "${XESS_SDK_DIR}/LICENSE.txt")
+		install(FILES "${XESS_SDK_DIR}/LICENSE.txt" DESTINATION licenses/XeSS-SDK)
+	endif()
+	if(EXISTS "${XESS_SDK_DIR}/third-party-programs.txt")
+		install(FILES "${XESS_SDK_DIR}/third-party-programs.txt" DESTINATION licenses/XeSS-SDK)
+	endif()
+endif()
+
 # Linux system libraries. Threads is also needed on macOS by experiments_tests.
 if(LINUX OR APPLE)
 	find_package(Threads REQUIRED)
@@ -859,6 +896,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_small_formatted_image_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --small-formatted-image-sync-only)
+	add_test(NAME graphics_partial_cp_copy
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --partial-cp-copy-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
@@ -896,6 +937,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME texture_cache_imageless_invalidation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --imageless-invalidation-only)
 	add_test(NAME indirect_write_tables
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-write-tables-only)
 	add_test(NAME color_render_target_1d

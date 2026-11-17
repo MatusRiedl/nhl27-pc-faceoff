@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/hitchWhy.h"
 #include "common/hostException.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -82,6 +83,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	// A page another thread's fault released but has not protected yet (PageManager::ReleaseScope).
+	if (m_page_manager.ApplyPending(fault_vaddr)) {
+		return true;
+	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		// Cache tracking may still protect a page whose range left the GPU-mapped set; that
 		// fault is ours to resolve, not a guest access violation.
@@ -89,6 +94,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			return false;
 		}
 	}
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Fault);
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	if (access == PageFaultAccess::Write && CpReadDebugEnabled()) {
 		ProtectStats::NoteWriteFaultPage(fault_vaddr);
@@ -128,6 +134,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		FrameBreakdown::g_in_fault = true;
 	}
 	if (access == PageFaultAccess::Write) {
+		// A guest thread's releases are protected when this ends, not under the tracking locks
+		// (in-boot A/B: execution 3.76 vs 3.95 us per draw, the guest threads' faults contend
+		// with its synchronizations). The GPU threads' faults can download into released pages.
+		const PageManager::ReleaseScope release_scope(!GuestGpu::IsGpuThread() &&
+		                                              !GuestGpu::IsCommandProcessorThread());
 		if (FrameBreakdown::Enabled()) {
 			FrameBreakdown::SpecNoteFault(fault_vaddr);
 		}
@@ -294,6 +305,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Unmap);
 		// Finishing the GPU protects GPU writes to the range. Queued GPU work only reads cached
 		// copies, host-only completions (cache bookkeeping, flips, interrupts) never touch the
 		// range, and completions writing guest memory (downloads) skip what was unmapped since

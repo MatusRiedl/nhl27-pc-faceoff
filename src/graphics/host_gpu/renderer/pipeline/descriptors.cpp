@@ -51,6 +51,7 @@
 #include <string_view>
 #include <unordered_set>
 #include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 
 #ifdef min
 #undef min
@@ -783,12 +784,13 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	auto&       found         = derived.found;
 	auto*       image         = texture_cache.m_slot_images.try_get(found.id);
 	const auto& range         = found.desc.info.data;
-	if (image == nullptr || !image->registered || image->binding.needs_rebind ||
+	// Null images (no guest range) are never registered and depend on no guest pages.
+	if (image == nullptr || (!image->registered && !range.Empty()) || image->binding.needs_rebind ||
 	    ImageLookupState::Of(found.id, *image) != found.state) {
 		found.valid = false;
 		return false;
 	}
-	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch) {
+	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch && !range.Empty()) {
 		if (texture_cache.ImageEpochInRegion(range.address, range.size) > found.image_set_epoch) {
 			found.valid = false;
 			return false;
@@ -829,6 +831,32 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
+		// Sampled null T#s go through the description memo like the others, so later draws reuse
+		// the lookup and its view (each draw built the null description, looked up its image and
+		// then its view again: about 1% of the execution thread in play).
+		if (!storage && !table_candidate && examined == nullptr &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+			const auto key    = MakeTextureDescKey(resource, value);
+			auto       cached = m_texture_descs.find(key);
+			if (cached == m_texture_descs.end()) {
+				TextureDescDerivation derived;
+				derived.desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+				if (m_texture_descs.size() >= MaxTextureDescs) {
+					m_clear_texture_descs = true;
+				}
+				cached = m_texture_descs.emplace(key, std::move(derived)).first;
+			}
+			auto& derived = cached->second;
+			if (derived.found.valid) {
+				TextureBinding binding;
+				if (ReuseTextureLookup(derived, binding)) {
+					return binding;
+				}
+			}
+			TextureBinding binding {texture_cache.FindImage(derived.desc), nullptr, derived.desc};
+			binding.lookup = &derived;
+			return binding;
+		}
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
@@ -908,18 +936,36 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		// Block-compressed images whose format has no storage support on this device (e.g.
 		// BC6H on AMD) are created without STORAGE usage; a storage view on them is invalid and
-		// hangs the GPU. Drop the guest's writes into a null storage image instead.
+		// hangs the GPU. By default the guest's writes go to a null storage image. With
+		// KYTY_BC_STORAGE_SHADOW=1 (duy64 2264c5ea) a binding whose view matches the block-storage
+		// shadow's shape is let through, so TextureCache::FindTexture substitutes the shadow, which
+		// takes the writes and flushes them back into the real image.
 		if (image->backing.image != nullptr &&
 		    !(image->backing.usage & vk::ImageUsageFlagBits::eStorage)) {
-			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-			if (!warned.test_and_set(std::memory_order_relaxed)) {
-				std::printf("Warning: dropping storage writes to %s image without storage usage\n",
-				            vk::to_string(image->info.pixel_format).c_str());
+			static const bool shadow_enabled = [] {
+				const char* e = std::getenv("KYTY_BC_STORAGE_SHADOW");
+				return e != nullptr && std::strcmp(e, "1") == 0;
+			}();
+			// Must match FindTexture's shadow substitution exactly: anything wider would build the
+			// invalid view this gate exists to prevent.
+			const bool shadowable = image->NeedsStorageShadow() && desc.view_info.level_count == 1 &&
+			                        vk::blockExtent(desc.view_info.format)[0] == 1 &&
+			                        vk::blockSize(desc.view_info.format) == image->info.bytes_per_block;
+			const bool shadow = shadow_enabled && shadowable;
+			// Logged first 4 times, then at powers of two, so a player log shows whether the game
+			// hits the drop and whether the shadow would take it.
+			static std::atomic<uint32_t> s_hits {0};
+			if (const auto n = s_hits.fetch_add(1, std::memory_order_relaxed); n < 4 || (n & (n - 1)) == 0) {
+				std::printf("NHL27BCSTORAGE #%u %s format=%s view=%s shadowable=%d\n", n + 1,
+				            shadow ? "shadow" : "drop", vk::to_string(image->info.pixel_format).c_str(),
+				            vk::to_string(desc.view_info.format).c_str(), shadowable ? 1 : 0);
 				std::fflush(stdout);
 			}
-			auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
-			const auto null_id   = texture_cache.FindImage(null_desc);
-			return {null_id, nullptr, std::move(null_desc)};
+			if (!shadow) {
+				auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
+				const auto null_id   = texture_cache.FindImage(null_desc);
+				return {null_id, nullptr, std::move(null_desc)};
+			}
 		}
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -1837,15 +1883,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			}
 		}
 	}
-	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
-	// after image identities are final; attachment layout transitions follow buffer alias copies.
-	{
-		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
-		FrameBreakdown::Timer rebind_timer(FrameBreakdown::g_counters.dp_rebind_ns);
-		for (auto* stage: stages) {
-			RebindBuffers(*stage);
-		}
-	}
+	// The draw's shader buffers are bound later, by ExecutePreparedDraw after the draw inputs.
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

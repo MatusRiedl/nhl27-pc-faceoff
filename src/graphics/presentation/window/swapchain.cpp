@@ -825,30 +825,41 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		                        source->image.format == vk::Format::eB8G8R8A8Unorm ||
 		                        source->image.format == vk::Format::eA2B10G10R10UnormPack32 ||
 		                        source->image.format == vk::Format::eA2R10G10B10UnormPack32;
-		std::string status = "fallback (HDR, format or downscaling)";
-		if (!source->hdr && !m_hdr_active && !source->blank && sdr_format &&
-		    blit_extent.width <= m_extent.width && blit_extent.height <= m_extent.height) {
+		// Up to the window size: EASU+RCAS (or RCAS alone at the same size). Larger than the window in
+		// both directions (the game's 4K output in a smaller window): downscale first, then RCAS at
+		// the window size, so the sharpening is not lost in the downscale.
+		const bool fits = blit_extent.width <= m_extent.width && blit_extent.height <= m_extent.height;
+		const bool shrinks = blit_extent.width >= m_extent.width && blit_extent.height >= m_extent.height;
+		std::string status = "fallback (HDR, format or aspect)";
+		if (!source->hdr && !m_hdr_active && !source->blank && sdr_format && (fits || shrinks)) {
 			if (m_fsr1.empty()) m_fsr1.resize(m_images.size());
 			auto& fsr = m_fsr1[m_image_index];
 			if (!fsr) fsr = std::make_unique<Fsr1>(m_window.graphic_ctx.physical_device, m_window.graphic_ctx.device);
-			if (!source->view) {
-				vk::ImageViewCreateInfo view {};
-				view.image = source->image.image;
-				view.viewType = vk::ImageViewType::e2D;
-				view.format = source->image.format;
-				view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-				RequireVulkanSuccess(m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view), "create FSR source view");
-			}
-			source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
 			static const float sharpness = [] {
 				const char* value = std::getenv("KYTY_FSR_SHARPNESS");
 				char* end = nullptr;
 				const float parsed = value ? std::strtof(value, &end) : 0.2f;
 				return value && (end == value || *end || !std::isfinite(parsed)) ? 0.2f : std::clamp(parsed, 0.0f, 1.0f);
 			}();
-			const auto output = fsr->Record(vk_command.Direct(), source->view, blit_extent, m_extent, sharpness);
+			vk::Image output;
+			if (fits) {
+				if (!source->view) {
+					vk::ImageViewCreateInfo view {};
+					view.image = source->image.image;
+					view.viewType = vk::ImageViewType::e2D;
+					view.format = source->image.format;
+					view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+					RequireVulkanSuccess(m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view), "create FSR source view");
+				}
+				source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+				output = fsr->Record(vk_command.Direct(), source->view, blit_extent, m_extent, sharpness);
+			} else {
+				source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+				output = fsr->RecordDownscaled(vk_command.Direct(), source->image.image, blit_extent, m_extent, sharpness);
+			}
 			if (output) {
-				status = fmt::format("{} {}x{} -> {}x{} sharpness={:.2f}", blit_extent == m_extent ? "RCAS" : "EASU+RCAS",
+				status = fmt::format("{} {}x{} -> {}x{} sharpness={:.2f}",
+				                     !fits ? "downscale+RCAS" : blit_extent == m_extent ? "RCAS" : "EASU+RCAS",
 				                     blit_extent.width, blit_extent.height, m_extent.width, m_extent.height, sharpness);
 				blit_source = output;
 				blit_extent = m_extent;
@@ -1143,8 +1154,13 @@ static void TrackPresentInterval(const GraphicContext& graphics) {
 	const float               dt = std::chrono::duration<float, std::milli>(now - last).count();
 	last                         = now;
 	window_ms.push_back(dt);
+	const double ticks_s = static_cast<double>(SDL_GetTicks()) / 1000.0;
 	if (dt > 40.0f) {
-		std::printf("NHL27HITCH t=%.2f dt=%.1fms\n", static_cast<double>(SDL_GetTicks()) / 1000.0, static_cast<double>(dt));
+		std::printf("NHL27HITCH t=%.2f dt=%.1fms\n", ticks_s, static_cast<double>(dt));
+	}
+	// NHL27HITCHWHY: where the time of a slow frame went (common/hitchWhy.h).
+	Common::HitchWhy::Frame(ticks_s, static_cast<double>(dt));
+	if (dt > 40.0f) {
 		std::fflush(stdout);
 	}
 	if (now - window_begin < std::chrono::seconds(5)) {

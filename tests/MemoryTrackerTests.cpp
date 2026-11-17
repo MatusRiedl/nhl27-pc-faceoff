@@ -793,6 +793,42 @@ void TestGpuMarkingSkipsCpuDirtyPages() {
   Release(memory);
 }
 
+// Upstream PR 1412: a guest write over GPU-claimed pages releases the GPU's claim and takes the
+// pages for the CPU in one call, without the "CPU dirty state conflicts" exit, and leaves the
+// neighbouring GPU page alone.
+void TestTakeGpuPagesForCpu() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsGpuModified(address, page_size * 2);
+  Check(tracker.IsRegionGpuModified(address, page_size * 2) &&
+            !tracker.IsRegionCpuModified(address, page_size * 2),
+        "setup did not give both pages to the GPU");
+  const auto generation = tracker.CpuModificationGeneration();
+  tracker.TakeGpuPagesForCpu(address + 8, 16);
+  Check(!tracker.IsRegionGpuModified(address, page_size) &&
+            tracker.IsRegionCpuModified(address, page_size),
+        "the written page did not move from the GPU to the CPU");
+  Check(tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            !tracker.IsRegionCpuModified(address + page_size, page_size),
+        "the neighbouring GPU page changed");
+  Check(tracker.CpuModificationGeneration() != generation,
+        "taking pages for the CPU did not invalidate preparation");
+  // Taking a page the GPU no longer claims is a plain CPU claim.
+  tracker.TakeGpuPagesForCpu(address, 8);
+  Check(tracker.IsRegionCpuModified(address, page_size),
+        "a second take lost the CPU claim");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestRangeInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1158,6 +1194,76 @@ void TestUploadDoesNotSerializeDisjointRegion() {
         "upload callback serialized an unrelated tracker region");
 }
 
+// A read-only upload of a CPU-clean range takes no region lock, even while other pages of the
+// region are CPU dirty (upstream db3f2758).
+void TestCleanReadOnlyUploadSkipsRegionLock() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, 3);
+  const auto written = reinterpret_cast<uint64_t>(memory);
+  const auto clean = written + page_size;
+  const auto dirty = written + page_size * 2;
+  Check((written & ~(region_size - 1)) == (dirty & ~(region_size - 1)),
+        "clean-upload test pages span two tracker regions");
+
+  // Upload the middle page once: it is CPU clean afterwards, the last page stays CPU dirty.
+  int setup_ranges = 0;
+  tracker.ForEachUploadRange(
+      clean, page_size, false,
+      [&](uint64_t, uint64_t) noexcept { setup_ranges++; }, []() noexcept {});
+  Check(setup_ranges == 1 && !tracker.IsRegionCpuModified(clean, page_size) &&
+            tracker.IsRegionCpuModified(dirty, page_size),
+        "clean-upload setup did not leave one clean and one dirty page");
+
+  std::binary_semaphore upload_entered{0};
+  std::binary_semaphore finish_upload{0};
+  std::binary_semaphore query_finished{0};
+  std::atomic_int clean_ranges{0};
+  // A written upload holds the region lock until its upload callback returns.
+  std::jthread uploader([&] {
+    tracker.ForEachUploadRange(
+        written, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          upload_entered.release();
+          finish_upload.acquire();
+        });
+  });
+  upload_entered.acquire();
+  std::jthread query([&] {
+    tracker.ForEachUploadRange(
+        clean, page_size, false,
+        [&](uint64_t, uint64_t) noexcept {
+          clean_ranges.fetch_add(1, std::memory_order_relaxed);
+        },
+        []() noexcept {});
+    query_finished.release();
+  });
+
+  const bool completed_while_upload_blocked =
+      query_finished.try_acquire_for(std::chrono::seconds(5));
+  finish_upload.release();
+  uploader.join();
+  query.join();
+
+  // The dirty page of the same region still uploads.
+  int dirty_ranges = 0;
+  tracker.ForEachUploadRange(
+      dirty, page_size, false,
+      [&](uint64_t, uint64_t) noexcept { dirty_ranges++; }, []() noexcept {});
+
+  tracker.UnmarkRegionAsGpuModified(written, page_size);
+  tracker.MarkRegionAsCpuModified(written, page_size * 3);
+  tracker.UntrackMemory(written, page_size * 3);
+  Release(memory);
+  Check(completed_while_upload_blocked &&
+            clean_ranges.load(std::memory_order_relaxed) == 0 &&
+            dirty_ranges == 1,
+        "a clean read-only upload waited for the region lock or a dirty page was skipped");
+}
+
 void TestDownloadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1501,6 +1607,7 @@ int main(int argc, char **argv) {
   TestRegionCpuDirtyEpoch();
   TestConsumeCpuWrites();
   TestGpuMarkingSkipsCpuDirtyPages();
+  TestTakeGpuPagesForCpu();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
@@ -1509,6 +1616,7 @@ int main(int argc, char **argv) {
   TestCrossRegionUpload();
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
+  TestCleanReadOnlyUploadSkipsRegionLock();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();

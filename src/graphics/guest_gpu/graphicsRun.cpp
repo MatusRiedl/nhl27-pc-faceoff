@@ -255,6 +255,7 @@ void GuestGpu::ProcessCommands() {
 
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
+	const Common::HitchWhy::Span hitch_hop(Common::HitchWhy::Kind::Hop);
 	if (IsGpuThread()) {
 		command();
 		return;
@@ -278,6 +279,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
+	const Common::HitchWhy::Span hitch_hop(Common::HitchWhy::Kind::Hop);
 	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
 		SendCommandSync(std::move(command));
 		return;
@@ -301,6 +303,7 @@ void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Urgent);
 	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
 	// Unmaps free memory that copies of executed draws may still read.
 	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
@@ -881,6 +884,7 @@ void GuestGpu::ExecutionThread() {
 	StageStats::t_role = StageStats::Role::Execution;
 	g_gpu_thread    = true;
 	g_execution_gpu = this;
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Draw);
 	RegionManager::MarkGpuOrderedThread();
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
@@ -899,11 +903,15 @@ void GuestGpu::ExecutionThread() {
 			if (StageStats::Enabled()) {
 				const auto start = std::chrono::steady_clock::now();
 				const auto cause = StageStats::ExecIdleCause();
-				operation        = operations.Pop();
+				{
+					const Common::HitchWhy::IdleScope hitch_idle(Common::HitchWhy::Role::Draw);
+					operation = operations.Pop();
+				}
 				StageStats::Add(StageStats::ExecIdle, start);
 				StageStats::Add(cause, start);
 				PrintStageStats();
 			} else {
+				const Common::HitchWhy::IdleScope hitch_idle(Common::HitchWhy::Role::Draw);
 				operation = operations.Pop();
 			}
 			Common::EventTrace::Record(Common::EventTrace::EXEC_WAIT_END);
@@ -922,6 +930,7 @@ void GuestGpu::ExecutionThread() {
 		const auto long_before = long_ops ? std::optional(LongOpCounters::Take()) : std::nullopt;
 		if (auto* slot = operation->dispatch_slot; slot != nullptr) {
 			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const Common::HitchWhy::SlotWait hitch_slot;
 				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
 				                                         : std::chrono::steady_clock::time_point {};
 				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
@@ -940,6 +949,7 @@ void GuestGpu::ExecutionThread() {
 		}
 		if (auto* slot = operation->draw_slot; slot != nullptr) {
 			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const Common::HitchWhy::SlotWait hitch_slot;
 				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
 				                                         : std::chrono::steady_clock::time_point {};
 				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
@@ -1009,6 +1019,7 @@ void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
 	StageStats::t_role = StageStats::Role::Resolve;
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto operation = m_operations.TryPop();
@@ -1137,6 +1148,7 @@ void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
 void GuestGpu::DrawResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolveDraw");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::DrawResolve);
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto job = m_draw_jobs.Pop();
@@ -1155,6 +1167,7 @@ void GuestGpu::DrawResolveThread() {
 void GuestGpu::DispatchResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolveDispatch");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::DispatchResolve);
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto job = m_dispatch_jobs.Pop();
@@ -2035,6 +2048,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = !gpu->m_pipelined;
 	g_cp_thread  = gpu->m_pipelined;
+	Common::HitchWhy::SetRole(gpu->m_pipelined ? Common::HitchWhy::Role::Cp : Common::HitchWhy::Role::Draw);
 	RegionManager::MarkGpuOrderedThread();
 	g_gpu_state  = gpu;
 	if (gpu->m_pipelined) {
@@ -2136,9 +2150,12 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				Common::EventTrace::Record(Common::EventTrace::GPU_WAIT_END,
 				                           gpu->m_commands.size() + gpu->m_submission_count);
-				FrameBreakdown::AddIdleGap(static_cast<uint64_t>(
+				const auto idle_ns = static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idle_start)
-				        .count()));
+				        .count());
+				FrameBreakdown::AddIdleGap(idle_ns);
+				Common::HitchWhy::AddIdle(gpu->m_pipelined ? Common::HitchWhy::Role::Cp : Common::HitchWhy::Role::Draw,
+				                          idle_ns);
 				Common::Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -3830,7 +3847,22 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id, false);
 }
 
+// The sequence of the last global barrier operation a pipelined command processor emitted.
+static uint64_t g_barrier_sequence = 0;
+
 void CommandProcessor::EmitGlobalBarrier() {
+	// A barrier right after another one, with no operation between them, orders nothing more: the
+	// execution thread skipped it (KYTY_GUEST_BARRIER_DEDUP), after its trip through the pipeline
+	// (in play 118k barrier and flush-event operations a second for 13k recorded barriers; in-boot
+	// A/B: operations -12%, execution 3.52 vs 3.65 us per draw).
+	if (m_pipeline != nullptr) {
+		const auto sequence = m_pipeline->NextSequence();
+		if (g_barrier_sequence != 0 && sequence == g_barrier_sequence + 1 &&
+		    Common::RuntimeFlags::Current().guest_barrier_dedup) {
+			return;
+		}
+		g_barrier_sequence = sequence;
+	}
 	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
 }
 
@@ -3928,6 +3960,35 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	const bool cache_event = event_index == 0x00000000 || event_index == 0x00000007;
+	switch (event_type) {
+		// The partial flushes and cache write-backs are global barriers (ExecuteTriggerEvent).
+		case 0x00000007:
+		case 0x0000000f:
+		case 0x00000010: EmitGlobalBarrier(); return;
+		case 0x00000016:
+		case 0x00000031:
+		case 0x0000002a:
+		case 0x0000002c:
+		case 0x0000002e:
+			if (cache_event) {
+				EmitGlobalBarrier();
+				return;
+			}
+			break;
+		// Ignored (ExecuteTriggerEvent): no operation.
+		case 0x0000000d:
+		case 0x0000000e:
+		case 0x00000012:
+		case 0x00000017:
+		case 0x00000018:
+		case 0x00000019:
+		case 0x0000001a:
+		case 0x0000001b:
+		case 0x00000038:
+		case 0x0000003a: return;
+		default: break;
+	}
 	// The occlusion counter dump writes guest memory (see CommandProcessor::Execute()).
 	const auto sequence = EmitCallback([this, event_type, event_index, event_address] {
 		ExecuteTriggerEvent(event_type, event_index, event_address);

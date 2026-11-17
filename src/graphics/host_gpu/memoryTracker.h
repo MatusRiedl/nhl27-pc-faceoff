@@ -46,6 +46,12 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// Releases the GPU's claim on the range's pages and gives them to the CPU in one critical
+	// section (upstream PR 1412). As two calls the halves are not atomic: an upload on another
+	// thread can mark a page GPU-dirty in between, and RegionManager then exits on "CPU dirty
+	// state conflicts with GPU dirty state". The guest is writing these bytes, so a GPU write
+	// in between is superseded; the claim covers whole pages (only redundant uploads).
+	void               TakeGpuPagesForCpu(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// CPU writes/invalidations and newly published initially-dirty regions invalidate BDA preparation.
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
@@ -361,9 +367,11 @@ public:
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			// A read-only use of a region without CPU-dirty pages has nothing to upload (a CPU
-			// write racing with this check is one that lands after the synchronization).
-			if (!is_written && !manager->HasCpuDirty()) {
+			// A read-only use of a range without CPU-dirty pages has nothing to upload (a CPU write racing
+			// with this check is one that lands after the synchronization). The region flag is the cheap
+			// test; the range test (upstream db3f2758) skips the lock when only other pages are dirty.
+			if (!is_written && (!manager->HasCpuDirty() ||
+			                    !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes))) {
 				return;
 			}
 			manager->lock.lock();

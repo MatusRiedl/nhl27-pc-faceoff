@@ -2,6 +2,72 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
+## v0.20.0
+
+- ⚡ **Faster draw path.** The emulator's speed profile (PGO) had gone stale: v0.10.x threw it away on 41 of its
+  hottest functions, which is most of why RC5 felt quicker. v0.20.0 is built with a fresh profile from a match and
+  an Edit Player session.
+- ⚡ **Lazy shared writes are back, at every frame rate** (`KYTY_LAZY_SHARED_WRITES=1`,
+  `KYTY_LAZY_SHARED_WRITES_RATES=all` in `builds/rc8/cfgGlobal.json`). v0.10.1 turned them off for the Edit Player
+  crash. The crash path is fixed now: a page the merge can't back is skipped instead of closing the emulator, and a
+  GPU-written page goes to the CPU in one step. Tested for 18 minutes in Edit Player's equipment grid with no crash.
+  In menus and editors it keeps about two CPU threads busy. If your PC struggles there, set
+  `"KYTY_LAZY_SHARED_WRITES_RATES": "60"` (play only) or `"KYTY_LAZY_SHARED_WRITES": "0"` (the v0.10.1 behaviour).
+- 🎬 **Fewer hitches after the puck drops.** The emulator now remembers which pipelines a session built and builds
+  them at start-up next time. In our test matches this cut pipeline work after play start from 0.9-2.2 s to under
+  0.1 s. The first session after updating builds the list, so it stutters as before; later sessions don't.
+- 🖼️ **Graphics tab in Faceoff:** upscaler (Off, FSR 2, XeSS, DLSS), quality presets, a sharpening slider and an
+  Advanced section.
+  - **DLSS** (`nvngx_dlss.dll` is included) needs a GeForce RTX card and a recent driver. It upscales from the same
+    render size as FSR 2 at the same preset, so expect a cleaner picture rather than more fps: in a 20-minute test
+    match it ran every frame with no failures at about the same fps as FSR 2. With DLSS picked, start-up takes about
+    0.2 s longer. If DLSS can't start, the game keeps its own FSR 2 and Faceoff's status line says so.
+  - **XeSS** (`libxess.dll` is included) runs on most DX12 GPUs. Its quality label can read one step higher in the
+    log than in Faceoff ("UltraQuality" for "Quality"), because the game's output target is smaller than the
+    window. The image is right.
+  - Sharpening below a 4K window now downscales first, then sharpens (RCAS).
+- 📊 **Last session card in Faceoff** (Log view): average fps, 1% low, frames over 50 ms and play time from your last
+  session, with a Copy button for Discord.
+- 🎮 **Controls tab in Faceoff:** rebind the keyboard and the controller. Click a box, then press the key or the
+  button; Escape cancels and × clears it. A key that is already taken swaps places, and the keys the emulator keeps
+  for itself (Escape, F1, F2, F7, F8, F11) are refused. Reset puts the built-in layout back. Until you change
+  something, Faceoff starts the game exactly as before.
+- 🧭 **Faceoff's Play tab redone:** builds as tiles, larger settings, and the window scales up on big screens.
+- **Fixes from KytyPS5**, each with its original author:
+  - Read-only binds over CPU-clean pages skip the region lock (nmzik).
+  - The detile scratch buffer is no longer zero-filled (nmzik).
+  - `V_PERM_B32` is translated (nmzik).
+  - Null textures reuse their lookups, image barriers stay inline, back-to-back barrier operations are dropped, and
+    page protection changes run outside the tracking locks (petrmolek).
+  - Upstream PRs 2193, 2224 and 2225 plus 22c02672 and 4f9d51dd: formatted reads cover the whole GPU-written image,
+    shader buffers bind after the draw inputs that can join them, CP copies reach every image they overlap, the
+    render area is bounded to the real image, and pages without images skip texture invalidation.
+- **Stability:** an overlap the texture cache can't resolve now recreates the image instead of closing the emulator
+  (the nhl24pc pattern).
+- **Logs:** the `NHL27ENV` start-up line lists every switch in effect, so a log shows exactly what ran. Slow frames
+  print `NHL27HITCHWHY`, which says where the time went.
+- **Measured** (CPU vs CPU, first period of a match, same PC and same day, one run of v0.10.1 against two of v0.20.0): play 1% low 40.6 →
+  48-50 fps, frames over 50 ms 2 → 7-9. Smoother on average, with a few more single long frames. Our test PC got
+  slower after a restart halfway through testing; before it, v0.20 held a 1% low of 56 over 20-minute matches with
+  0-2 frames over 50 ms.
+- **Known:**
+  - A few of our long test runs froze for good at a cutscene cut (a wait that never finished), on older v0.20 test
+    builds as well. If it happens to you, send `play_log.txt`.
+  - GPU hangs and stalls in our last test session. Of its nine test matches, three closed with a GPU hang
+    (`masterSemaphore.cpp:159`): two with FSR 2, 20 s and 105 s into play, and one with DLSS, 55 s into play. Two
+    more FSR 2 matches froze for 25-30 s and then carried on. The matches before that session were clean with
+    FSR 2, DLSS and XeSS. The cause is not found. Our test PC was at its memory limit during these runs, which may
+    be related: the emulator commits about 14 GB at start-up and 10-15 GB more in a match (RAM plus pagefile), so
+    close other large apps before you play. If it happens to you, send `play_log.txt`.
+  - Some GPU-written data can still reach the CPU late; it shows as rare wrong materials in a few scenes.
+  - Faceoff can open with an empty window. On our test PC, RivaTuner Statistics Server (the overlay that comes
+    with MSI Afterburner) crashed the window's browser part (WebView2) at start-up, about one start in six. Close
+    Faceoff and start it again. Earlier Faceoff versions do the same.
+- **Updating:**
+  - From v0.10.x, Faceoff updates itself and the build.
+  - From RC5, take `Faceoff.exe` out of the release zip once and put it over the old one.
+  - Saves stay. The shader cache rebuilds once (the shader translation changed).
+
 ## v0.10.1
 
 - 🩹 **Edit / Create Player no longer crashes** when you scroll through equipment. Thanks to the player who found it.

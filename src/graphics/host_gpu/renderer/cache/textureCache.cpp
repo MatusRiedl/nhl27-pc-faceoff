@@ -331,6 +331,34 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+TextureCache::RegisteredPageCounts::RegisteredPageCounts(): m_leaves(std::make_unique<Table>()) {}
+
+TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
+	for (auto& leaf: *m_leaves) {
+		delete leaf.load(std::memory_order_relaxed);
+	}
+}
+
+void TextureCache::RegisteredPageCounts::Add(size_t page, int32_t delta) {
+	auto& slot = (*m_leaves)[page >> kLeafBits];
+	auto* leaf = slot.load(std::memory_order_relaxed);
+	if (leaf == nullptr) {
+		leaf = new Leaf {};
+		slot.store(leaf, std::memory_order_release);
+	}
+	(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta), std::memory_order_release);
+}
+
+bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive) const noexcept {
+	for (auto page = first; page < last_exclusive; page++) {
+		const auto* leaf = (*m_leaves)[page >> kLeafBits].load(std::memory_order_acquire);
+		if (leaf != nullptr && (*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -342,6 +370,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_registered_pages.Add(page, 1);
 	});
 	m_images_by_address[image.info.data.address].push_back(id);
 	const auto filter_index = AddressFilterIndex(image.info.data.address);
@@ -381,6 +410,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		m_registered_pages.Add(page, -1);
 	});
 	{
 		const auto by_address = m_images_by_address.find(image.info.data.address);
@@ -1394,15 +1424,23 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
-		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
-		     " requested=%ux%u "
-		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
-		     requested.data.address, requested.resources.levels, requested.resources.layers,
-		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
-		     cached.info.data.size, static_cast<uint32_t>(requested.type),
-		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		// Same format, larger guest allocation and no expansion rule above applies: this used to EXIT. Treat it like
+		// the separate-layout case above (nhl24pc e8ca752): drop the old image when it is idle and let the requested
+		// one be created from guest memory.
+		static std::atomic<uint32_t> s_recreated {0};
+		if (const auto n = s_recreated.fetch_add(1, std::memory_order_relaxed); n < 16 || (n & (n - 1)) == 0) {
+			std::printf("NHL27OVERLAP recreate #%u address=0x%016" PRIx64 " requested=%ux%u cached=%ux%u "
+			            "requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64 " type=%u tile=%u/%u freed=%d\n",
+			            n + 1, requested.data.address, requested.resources.levels, requested.resources.layers,
+			            cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
+			            cached.info.data.size, static_cast<uint32_t>(requested.type),
+			            static_cast<uint32_t>(requested.tile_mode), static_cast<uint32_t>(cached.info.tile_mode),
+			            safe_to_delete ? 1 : 0);
+		}
+		if (safe_to_delete) {
+			FreeImage(cached_id);
+		}
+		return {merged_id};
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
@@ -1682,27 +1720,34 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
 		if (shadowed) {
 			// A repeated dword is one repeated byte only when all four of its bytes agree.
 			if (shadow_value != static_cast<uint32_t>(code) * 0x01010101u) {
 				continue;
 			}
 		} else {
-			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-				EXIT("TextureCache: failed to read color metadata slice\n");
+			// Compared in the backing store, eight bytes at a time, up to the first other byte:
+			// copying the slice (tens of KiB) first, for render targets whose first metadata byte is
+			// a clear code but whose slice is not uniform, ran on every lookup of them (with a heap
+			// allocation, 1.7% of the execution thread in play).
+			std::vector<uint8_t> copy;
+			const auto*          bytes = static_cast<const uint8_t*>(LibKernel::Memory::FindBackingPointer(address, slice_size));
+			if (bytes == nullptr) {
+				copy.resize(slice_size);
+				if (!LibKernel::Memory::TryReadBacking(address, copy.data(), copy.size())) {
+					EXIT("TextureCache: failed to read color metadata slice\n");
+				}
+				bytes = copy.data();
 			}
-			// Eight bytes at a time: metadata slices are tens of KiB (1.5% of the execution thread
-			// when compared bytewise).
 			const uint64_t pattern = uint64_t {code} * 0x0101010101010101ull;
 			size_t         at      = 0;
 			bool           uniform = true;
-			for (; uniform && at + sizeof(uint64_t) <= bytes.size(); at += sizeof(uint64_t)) {
+			for (; uniform && at + sizeof(uint64_t) <= slice_size; at += sizeof(uint64_t)) {
 				uint64_t word = 0;
-				std::memcpy(&word, bytes.data() + at, sizeof(word));
+				std::memcpy(&word, bytes + at, sizeof(word));
 				uniform = word == pattern;
 			}
-			for (; uniform && at < bytes.size(); ++at) {
+			for (; uniform && at < slice_size; ++at) {
 				uniform = bytes[at] == code;
 			}
 			if (!uniform) {
@@ -1725,7 +1770,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data, and without reading GPU-owned metadata back first.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			const std::vector<uint8_t> bytes(slice_size, uint8_t {0xff});
 			if (shadowed) {
 				// The expanded keys below replace the GPU's fill, so there is nothing to download.
 				m_buffer_cache.DiscardGpuModified(address, slice_size);
@@ -2585,6 +2630,14 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	// Images register their pages before they are tracked (and are untracked before they leave
+	// them), so CPU writes to pages without one have nothing to invalidate. Most write faults land
+	// there and need not wait for the lock the GPU thread holds while it records draws.
+	ImagePageTable::PageRange pages {};
+	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
+	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
+		return;
+	}
 	std::unique_lock lock {m_lock, std::defer_lock};
 	{
 		FrameBreakdown::FaultTimer lock_timer(FrameBreakdown::g_fault_cost.lock_ns);
@@ -2676,11 +2729,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
-	if (!selected) {
-		return false;
-	}
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId selected) {
 	buffer.last_write_tick = m_scheduler.CurrentTick();
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
@@ -2819,6 +2868,35 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			}
 			image.ClearGpuModified();
 		}
+		image.MarkBufferModified();
+	}
+}
+
+void TextureCache::PrepareBufferWrite(uint64_t address, uint64_t size) {
+	// Upstream PR 2225: InvalidateMemoryFromGPU reaches only an image based at the address, so a
+	// copy into the middle of an image left its texels untouched and later samples read the old
+	// contents. CP copies and fills are rare next to storage binds, so the page walk is affordable.
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr) {
+			continue;
+		}
+		auto&       image    = *owner;
+		const auto& data     = image.info.data;
+		const bool  readable = !image.depth_id && CanDownload(image);
+		if (!readable && data.address != address) {
+			continue;
+		}
+		const bool covered = address <= data.address && data.End() <= address + size;
+		// Publish downloads the image into the buffer cache and marks it buffer-modified.
+		if (readable && !covered && image.SafeToDownload() && BcAlias::Publish(*this, image)) {
+			continue;
+		}
+		image.ClearGpuModified();
 		image.MarkBufferModified();
 	}
 }

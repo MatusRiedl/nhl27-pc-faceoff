@@ -211,6 +211,8 @@ struct ShaderProgram {
 
 // The owning renderer serializes access, including saves while the GPU is running.
 namespace PipelineRecord { class RecordFile; struct Records; }
+struct StoredPipeline;
+class PipelineStore;
 
 class PipelineCache {
 public:
@@ -225,6 +227,10 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Built at start-up from the pipeline store and not used by a draw or dispatch yet.
+		bool                    prebuilt              = false;
+		// For such a graphics pipeline: GraphicsInputCheck of the inputs it was built from.
+		uint64_t                input_check           = 0;
 	};
 
 	struct GraphicsPrograms {
@@ -322,9 +328,41 @@ private:
 	void RecordGraphicsPipeline(const GraphicsPipelineKey& key,
 	                            std::span<const ShaderVertexInputInfo> vertex_info,
 	                            const ShaderPixelInputInfo* ps_input_info);
+	// The pipeline store (pipelineStore.h): the pipelines created at first use are appended to it,
+	// and the next start-up builds them once the stored programs are compiled.
+	std::unique_ptr<PipelineStore> m_pipeline_store;
+	// NHL27PIPESTORE: pipelines built at start-up, how many of those were then used as built, how
+	// many were built again because the first draw brought other inputs, how many pipelines were
+	// still created at first use, and how many of these were added to the store.
+	std::atomic_uint64_t m_prebuilt {0};
+	std::atomic_uint64_t m_prebuilt_used {0};
+	std::atomic_uint64_t m_prebuilt_rebuilt {0};
+	std::atomic_uint64_t m_first_use {0};
+	std::atomic_uint64_t m_stored {0};
+	uint64_t             m_logged_used      = 0;
+	uint64_t             m_logged_first_use = 0;
+	std::vector<StoredPipeline> OpenPipelineStore(const std::filesystem::path& path);
+	void PrebuildPipelines(std::vector<StoredPipeline>& records);
+	void StoreGraphicsPipeline(const GraphicsPipelineKey& key,
+	                           std::span<const ShaderVertexInputInfo> vertex_info,
+	                           const ShaderPixelInputInfo* ps_input_info);
+	void StoreComputePipeline(const ShaderComputeInputInfo& input_info, const ShaderProgram& program);
+	void LogPipelineStoreUse();
+	void DestroyPipeline(Pipeline& pipeline);
+	void UsePrebuiltGraphics(Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                         std::span<const ShaderVertexInputInfo> vertex_info,
+	                         const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
+	void NotePipelineUse(Pipeline& pipeline) {
+		if (pipeline.prebuilt) [[unlikely]] {
+			pipeline.prebuilt = false;
+			m_prebuilt_used.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
 	void WriteDriverCache();
 	void CheckpointDriverCache();
+	void LogFirstUse(const char* kind, std::chrono::steady_clock::time_point begin, uint64_t first_id,
+	                 uint64_t second_id);
 
 };
 

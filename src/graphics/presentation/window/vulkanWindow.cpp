@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/dlssBridge.h"
 #include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -30,6 +31,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -514,6 +516,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		if (queue_family < families.size() && families[queue_family].queueCount >= 2) {
 			queue_create_info.queueCount = 2;
 		}
+		// KYTY_VK_DEVICE_ONE_QUEUE=1 (probe boots only, the window code fetches queue 1 later): one queue on the
+		// graphics family; with KYTY_READBACK_FAMILIES=0 the device has a single queue, like upstream.
+		if (const char* one = std::getenv("KYTY_VK_DEVICE_ONE_QUEUE");
+		    one != nullptr && one[0] == '1' && std::getenv("KYTY_VK_DEVICE_PROBE") != nullptr) {
+			queue_create_info.queueCount = 1;
+		}
 		queue_create_infos.push_back(queue_create_info);
 		graphics.buffer_families = {queue_family};
 		// Readback queues beside the graphics engine (experiments ReadbackCompute/Transfer).
@@ -949,7 +957,39 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     device_fault.deviceFault);
 		Log::Flush();
 	}
+	const bool probe = std::getenv("KYTY_VK_DEVICE_PROBE") != nullptr;
+	// KYTY_VK_DEVICE_DROP_STYPE=<n>[,<n>...]: unlink the feature structs with these VkStructureType numbers from
+	// the chain (diagnostic bisect; a renderer path that needs one may fail later).
+	if (const char* drop = std::getenv("KYTY_VK_DEVICE_DROP_STYPE"); drop != nullptr && drop[0] != '\0') {
+		const std::string list = std::string(",") + drop + ",";
+		auto*             prev = reinterpret_cast<VkBaseOutStructure*>(&create_info);
+		while (prev->pNext != nullptr) {
+			VkBaseOutStructure* next = prev->pNext;
+			if (list.find("," + std::to_string(static_cast<int>(next->sType)) + ",") != std::string::npos) {
+				std::printf("NHL27DEVICE drop sType=%d\n", static_cast<int>(next->sType));
+				prev->pNext = next->pNext;
+			} else {
+				prev = next;
+			}
+		}
+	}
+	if (probe) {
+		for (const auto* s = static_cast<const VkBaseInStructure*>(create_info.pNext); s != nullptr; s = s->pNext) {
+			std::printf("NHL27DEVICE chain sType=%d\n", static_cast<int>(s->sType));
+		}
+		for (uint32_t i = 0; i < create_info.queueCreateInfoCount; i++) {
+			std::printf("NHL27DEVICE queue family=%u count=%u\n", create_info.pQueueCreateInfos[i].queueFamilyIndex,
+			            create_info.pQueueCreateInfos[i].queueCount);
+		}
+		std::fflush(stdout);
+	}
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
+	std::printf("NHL27DEVICE vkCreateDevice result=%s\n", vk::to_string(result).c_str());
+	std::fflush(stdout);
+	if (probe) {
+		// KYTY_VK_DEVICE_PROBE: stop right after device creation (10-second bisect boots).
+		std::_Exit(result == vk::Result::eSuccess ? 0 : 2);
+	}
 	if (Config::RenderDocEnabled()) {
 		LOGF("RenderDoc: vkCreateDevice result=%s\n", vk::to_string(result).c_str());
 	}
@@ -1162,6 +1202,113 @@ static void VulkanCheckInstanceVersion() {
 	}
 }
 
+// KYTY_NVX_SELFTEST=<point>|all (diagnostic): at that start-up point, create a throwaway Vulkan instance and a bare
+// device on the NVIDIA GPU with the extensions DLSS needs (VK_NVX_binary_import among them) and print the result.
+// Finds the start-up step after which the driver refuses VK_NVX_binary_import.
+static void NvxThrowawayDevice(const char* tag, const char* where) {
+	const auto        start = std::chrono::steady_clock::now();
+	SDL_SharedObject* lib = SDL_LoadObject("vulkan-1.dll");
+	auto gipa = lib != nullptr ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_LoadFunction(lib, "vkGetInstanceProcAddr"))
+	                           : nullptr;
+	if (gipa == nullptr) {
+		std::printf("%s where=%s no vulkan-1.dll\n", tag, where);
+		std::fflush(stdout);
+		return;
+	}
+	auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
+	const char*       inst_ext[] = {"VK_KHR_get_physical_device_properties2"};
+	VkApplicationInfo app {};
+	app.sType      = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	app.apiVersion = VK_API_VERSION_1_3;
+	VkInstanceCreateInfo ici {};
+	ici.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	ici.pApplicationInfo        = &app;
+	ici.enabledExtensionCount   = 1;
+	ici.ppEnabledExtensionNames = inst_ext;
+	VkInstance inst      = VK_NULL_HANDLE;
+	const VkResult ri    = create_instance(&ici, nullptr, &inst);
+	VkResult       rd    = VK_RESULT_MAX_ENUM;
+	if (ri == VK_SUCCESS) {
+		auto enum_pd   = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(inst, "vkEnumeratePhysicalDevices"));
+		auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa(inst, "vkGetPhysicalDeviceProperties"));
+		auto get_qf    = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties"));
+		auto create_device  = reinterpret_cast<PFN_vkCreateDevice>(gipa(inst, "vkCreateDevice"));
+		auto destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(gipa(inst, "vkDestroyDevice"));
+		auto destroy_inst   = reinterpret_cast<PFN_vkDestroyInstance>(gipa(inst, "vkDestroyInstance"));
+		uint32_t         n = 8;
+		VkPhysicalDevice pds[8] {};
+		enum_pd(inst, &n, pds);
+		VkPhysicalDevice pd = VK_NULL_HANDLE;
+		for (uint32_t i = 0; i < n && pd == VK_NULL_HANDLE; i++) {
+			VkPhysicalDeviceProperties p {};
+			get_props(pds[i], &p);
+			if (p.vendorID == 0x10de) {
+				pd = pds[i];
+			}
+		}
+		if (pd != VK_NULL_HANDLE) {
+			uint32_t                qn = 16;
+			VkQueueFamilyProperties qf[16] {};
+			get_qf(pd, &qn, qf);
+			uint32_t fam = 0;
+			for (uint32_t i = 0; i < qn; i++) {
+				if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+					fam = i;
+					break;
+				}
+			}
+			const float             prio = 1.0f;
+			VkDeviceQueueCreateInfo qci {};
+			qci.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+			qci.queueFamilyIndex = fam;
+			qci.queueCount       = 1;
+			qci.pQueuePriorities = &prio;
+			const char* dev_ext[] = {"VK_KHR_push_descriptor", "VK_NVX_image_view_handle",
+			                         "VK_KHR_buffer_device_address", "VK_NVX_binary_import"};
+			VkDeviceCreateInfo dci {};
+			dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+			dci.queueCreateInfoCount    = 1;
+			dci.pQueueCreateInfos       = &qci;
+			dci.enabledExtensionCount   = 4;
+			dci.ppEnabledExtensionNames = dev_ext;
+			VkDevice dev = VK_NULL_HANDLE;
+			rd           = create_device(pd, &dci, nullptr, &dev);
+			if (rd == VK_SUCCESS) {
+				destroy_device(dev, nullptr);
+			}
+		}
+		destroy_inst(inst, nullptr);
+	}
+	const auto us =
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+	std::printf("%s where=%s instance=%d device=%d us=%lld\n", tag, where, static_cast<int>(ri), static_cast<int>(rd),
+	            static_cast<long long>(us));
+	std::fflush(stdout);
+}
+
+void NvxSelfTest(const char* where) {
+	const char* want = std::getenv("KYTY_NVX_SELFTEST");
+	if (want == nullptr || (std::strcmp(want, "all") != 0 && std::strcmp(want, where) != 0)) {
+		return;
+	}
+	NvxThrowawayDevice("NHL27NVXTEST", where);
+}
+
+// DLSS on the rendering device needs VK_NVX_binary_import, which the NVIDIA driver backs with CUDA. CUDA reserves
+// address space of its own the first time such a device is created, and vkCreateDevice fails with
+// VK_ERROR_INITIALIZATION_FAILED once the guest address space has placeholder-reserved the ranges it wants (bisected:
+// fine right before GuestAddressSpace::ReserveGuestRegions, failing right after). Called right before that
+// reservation: one throwaway device lets CUDA take its range first, and it keeps it for the process. The guest
+// then owns less address space (about 66 GiB on an RTX 5080), so this runs only with KYTY_DLSS=1 in a DLSS build;
+// KYTY_DLSS_WARMUP=0 skips it.
+void DlssWarmUp() {
+	if (!DlssEarlyWarmUpWanted()) {
+		return;
+	}
+	NvxThrowawayDevice("NHL27DLSS warmup", "guest-reserve");
+}
+
 void WindowContext::CreateVulkan() {
 	EXIT_IF(window == nullptr);
 	EXIT_IF(graphic_ctx.instance != nullptr);
@@ -1176,11 +1323,15 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
+	NvxSelfTest("T5_window");
 	Vr::OpenXrInit();
+	NvxSelfTest("T6_openxr");
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
 	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
+	// DLSS bridge (KYTY_DLSS=1): NGX needs its own instance extensions (no-op otherwise).
+	DlssAppendInstanceExtensions(r.required_extensions, r.available_extensions);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1280,6 +1431,7 @@ void WindowContext::CreateVulkan() {
 	}
 	surface = native_surface;
 
+	std::vector<const char*> ngx_extensions; // what the DLSS bridge appended, for the retry below
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -1384,7 +1536,10 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			// The list above may already hold it: enable it once.
+			if (!HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			}
 			graphic_ctx.conditional_rendering_enabled = true;
 		}
 #if defined(_WIN32)
@@ -1412,13 +1567,60 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		// DLSS bridge (KYTY_DLSS=1): NGX needs its own device extensions on the
+		// rendering device (no-op otherwise).
+		const size_t before_ngx = device_extensions.size();
+		DlssAppendDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions,
+		                           device_extensions);
+		ngx_extensions.assign(device_extensions.begin() + static_cast<std::ptrdiff_t>(before_ngx),
+		                      device_extensions.end());
 	}
 
+	// KYTY_VK_DEVICE_DEDUP=1: enable each device extension once (the list can repeat one).
+	if (const char* dedup = std::getenv("KYTY_VK_DEVICE_DEDUP"); dedup != nullptr && dedup[0] == '1') {
+		std::vector<const char*> unique;
+		for (const char* ext: device_extensions) {
+			if (!HasExtension(unique, ext)) {
+				unique.push_back(ext);
+			}
+		}
+		device_extensions.swap(unique);
+	}
+	// KYTY_VK_DEVICE_DROP=<name>[,<name>...]: leave these device extensions out (diagnostic bisect; a renderer
+	// path that needs one may fail later).
+	if (const char* drop = std::getenv("KYTY_VK_DEVICE_DROP"); drop != nullptr && drop[0] != '\0') {
+		const std::string list = std::string(",") + drop + ",";
+		std::erase_if(device_extensions, [&](const char* ext) {
+			return list.find(std::string(",") + ext + ",") != std::string::npos;
+		});
+	}
+	if (std::getenv("KYTY_VK_DEVICE_PROBE") != nullptr) {
+		for (const char* ext: device_extensions) {
+			std::printf("NHL27DEVICE extension %s\n", ext);
+		}
+	}
+	NvxSelfTest("T7_device");
+	std::printf("NHL27DEVICE create begin extensions=%zu\n", device_extensions.size());
+	std::fflush(stdout);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	if (graphic_ctx.device == nullptr && !ngx_extensions.empty()) {
+		// The extensions DLSS asked for can still make creation fail (see DlssWarmUp). The game runs fine on its own
+		// upscaler chain without them: drop them, turn DLSS off for this session and try once more.
+		std::printf("NHL27DLSS device creation failed with %zu NGX extensions, retrying without them\n",
+		            ngx_extensions.size());
+		std::fflush(stdout);
+		std::erase_if(device_extensions, [&](const char* ext) { return HasExtension(ngx_extensions, ext); });
+		DlssDisable();
+		graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	}
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
 	}
+	std::printf("NHL27DEVICE created\n");
+	std::fflush(stdout);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	std::printf("NHL27DEVICE dispatcher ok\n");
+	std::fflush(stdout);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	{
