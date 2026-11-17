@@ -515,6 +515,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		if (queue_family < families.size() && families[queue_family].queueCount >= 2) {
 			queue_create_info.queueCount = 2;
 		}
+		// KYTY_VK_DEVICE_ONE_QUEUE=1 (probe boots only, the window code fetches queue 1 later): one queue on the
+		// graphics family; with KYTY_READBACK_FAMILIES=0 the device has a single queue, like upstream.
+		if (const char* one = std::getenv("KYTY_VK_DEVICE_ONE_QUEUE");
+		    one != nullptr && one[0] == '1' && std::getenv("KYTY_VK_DEVICE_PROBE") != nullptr) {
+			queue_create_info.queueCount = 1;
+		}
 		queue_create_infos.push_back(queue_create_info);
 		graphics.buffer_families = {queue_family};
 		// Readback queues beside the graphics engine (experiments ReadbackCompute/Transfer).
@@ -950,7 +956,39 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     device_fault.deviceFault);
 		Log::Flush();
 	}
+	const bool probe = std::getenv("KYTY_VK_DEVICE_PROBE") != nullptr;
+	// KYTY_VK_DEVICE_DROP_STYPE=<n>[,<n>...]: unlink the feature structs with these VkStructureType numbers from
+	// the chain (diagnostic bisect; a renderer path that needs one may fail later).
+	if (const char* drop = std::getenv("KYTY_VK_DEVICE_DROP_STYPE"); drop != nullptr && drop[0] != '\0') {
+		const std::string list = std::string(",") + drop + ",";
+		auto*             prev = reinterpret_cast<VkBaseOutStructure*>(&create_info);
+		while (prev->pNext != nullptr) {
+			VkBaseOutStructure* next = prev->pNext;
+			if (list.find("," + std::to_string(static_cast<int>(next->sType)) + ",") != std::string::npos) {
+				std::printf("NHL27DEVICE drop sType=%d\n", static_cast<int>(next->sType));
+				prev->pNext = next->pNext;
+			} else {
+				prev = next;
+			}
+		}
+	}
+	if (probe) {
+		for (const auto* s = static_cast<const VkBaseInStructure*>(create_info.pNext); s != nullptr; s = s->pNext) {
+			std::printf("NHL27DEVICE chain sType=%d\n", static_cast<int>(s->sType));
+		}
+		for (uint32_t i = 0; i < create_info.queueCreateInfoCount; i++) {
+			std::printf("NHL27DEVICE queue family=%u count=%u\n", create_info.pQueueCreateInfos[i].queueFamilyIndex,
+			            create_info.pQueueCreateInfos[i].queueCount);
+		}
+		std::fflush(stdout);
+	}
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
+	std::printf("NHL27DEVICE vkCreateDevice result=%s\n", vk::to_string(result).c_str());
+	std::fflush(stdout);
+	if (probe) {
+		// KYTY_VK_DEVICE_PROBE: stop right after device creation (10-second bisect boots).
+		std::_Exit(result == vk::Result::eSuccess ? 0 : 2);
+	}
 	if (Config::RenderDocEnabled()) {
 		LOGF("RenderDoc: vkCreateDevice result=%s\n", vk::to_string(result).c_str());
 	}
@@ -1421,6 +1459,29 @@ void WindowContext::CreateVulkan() {
 		                           device_extensions);
 	}
 
+	// KYTY_VK_DEVICE_DEDUP=1: enable each device extension once (the list can repeat one).
+	if (const char* dedup = std::getenv("KYTY_VK_DEVICE_DEDUP"); dedup != nullptr && dedup[0] == '1') {
+		std::vector<const char*> unique;
+		for (const char* ext: device_extensions) {
+			if (!HasExtension(unique, ext)) {
+				unique.push_back(ext);
+			}
+		}
+		device_extensions.swap(unique);
+	}
+	// KYTY_VK_DEVICE_DROP=<name>[,<name>...]: leave these device extensions out (diagnostic bisect; a renderer
+	// path that needs one may fail later).
+	if (const char* drop = std::getenv("KYTY_VK_DEVICE_DROP"); drop != nullptr && drop[0] != '\0') {
+		const std::string list = std::string(",") + drop + ",";
+		std::erase_if(device_extensions, [&](const char* ext) {
+			return list.find(std::string(",") + ext + ",") != std::string::npos;
+		});
+	}
+	if (std::getenv("KYTY_VK_DEVICE_PROBE") != nullptr) {
+		for (const char* ext: device_extensions) {
+			std::printf("NHL27DEVICE extension %s\n", ext);
+		}
+	}
 	std::printf("NHL27DEVICE create begin extensions=%zu\n", device_extensions.size());
 	std::fflush(stdout);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
