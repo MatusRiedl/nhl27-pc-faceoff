@@ -1421,11 +1421,17 @@ void WindowContext::CreateVulkan() {
 		                           device_extensions);
 	}
 
+	std::printf("NHL27DEVICE create begin extensions=%zu\n", device_extensions.size());
+	std::fflush(stdout);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
 	}
+	std::printf("NHL27DEVICE created\n");
+	std::fflush(stdout);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	std::printf("NHL27DEVICE dispatcher ok\n");
+	std::fflush(stdout);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	{

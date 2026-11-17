@@ -754,7 +754,33 @@ namespace {
 // Appends the NGX-required extension names the driver actually exposes and that are
 // not already enabled (the filter upstream KytyPS5's DLSS applies to the same
 // lists). The strings point into NGX's own storage and stay valid for the process.
-void AppendNgxExtensions(const VkExtensionProperties* required, uint32_t count,
+// Names never appended. KYTY_DLSS_VK_SKIP_EXT=<name>[,<name>...] replaces the list
+// ("none" = skip nothing). Default: every device extension NGX asked for on an RTX 5080
+// (driver 2026-11): enabling VK_NVX_binary_import on our device crashes inside
+// vkCreateDevice (0xC0000005, v020j boots), and without it NGX reports DLSS unavailable,
+// so the bridge falls back to the game's chain instead of crashing the boot.
+// VK_EXT_buffer_device_address must never be enabled next to the core bufferDeviceAddress.
+bool NgxExtensionSkipped(const char* name) {
+	const char* env  = std::getenv("KYTY_DLSS_VK_SKIP_EXT");
+	const char* list = env != nullptr ? env
+	                                    : "VK_EXT_buffer_device_address,VK_KHR_buffer_device_address,"
+	                                      "VK_NVX_binary_import,VK_NVX_image_view_handle";
+	const size_t len = std::strlen(name);
+	for (const char* p = list; *p != '\0';) {
+		const char* end = std::strchr(p, ',');
+		const size_t n  = end != nullptr ? static_cast<size_t>(end - p) : std::strlen(p);
+		if (n == len && std::strncmp(p, name, n) == 0) {
+			return true;
+		}
+		if (end == nullptr) {
+			break;
+		}
+		p = end + 1;
+	}
+	return false;
+}
+
+void AppendNgxExtensions(const char* kind, const VkExtensionProperties* required, uint32_t count,
                          const std::vector<vk::ExtensionProperties>& available,
                          std::vector<const char*>& extensions) {
 	for (uint32_t i = 0; i < count; ++i) {
@@ -766,10 +792,15 @@ void AppendNgxExtensions(const VkExtensionProperties* required, uint32_t count,
 		const bool present = std::any_of(extensions.begin(), extensions.end(), [name](const char* e) {
 			return std::strcmp(e, name) == 0;
 		});
-		if (exposed && !present) {
+		const bool skipped  = NgxExtensionSkipped(name);
+		const bool appended = exposed && !present && !skipped;
+		if (appended) {
 			extensions.push_back(name);
 		}
+		std::printf("NHL27DLSS vk %s extension=%s exposed=%d present=%d skipped=%d appended=%d\n", kind, name,
+		            exposed ? 1 : 0, present ? 1 : 0, skipped ? 1 : 0, appended ? 1 : 0);
 	}
+	std::fflush(stdout);
 }
 
 } // namespace
@@ -787,7 +818,7 @@ void DlssAppendInstanceExtensions(std::vector<const char*>& extensions,
 	    NVSDK_NGX_Result_Success) {
 		return;
 	}
-	AppendNgxExtensions(required, count, available, extensions);
+	AppendNgxExtensions("instance", required, count, available, extensions);
 #else
 	(void)extensions;
 	(void)available;
@@ -818,7 +849,7 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
 	            requirement.MinHWArchitecture, static_cast<int>(ext_result), count);
 	std::fflush(stdout);
 	if (ext_result == NVSDK_NGX_Result_Success) {
-		AppendNgxExtensions(required, count, available, extensions);
+		AppendNgxExtensions("device", required, count, available, extensions);
 	}
 #else
 	(void)instance;
