@@ -2,7 +2,7 @@
 
 ## 1. Install
 
-1. Download `Faceoff-v0.10.1.zip` from the [release page](../../releases/latest).
+1. Download `Faceoff-v0.20.0.zip` from the [release page](../../releases/latest).
 2. Extract it anywhere you can write to, with at least 2 GB free. Not inside `Program Files`.
 3. Start `Faceoff.exe`. If Windows SmartScreen warns, choose **More info**, then **Run anyway**. If Faceoff asks for
    Microsoft's WebView2 Runtime, install it and start Faceoff again.
@@ -18,10 +18,10 @@ Press **Browse** on the Play tab and pick your NHL 27 folder, the one that holds
 
 ## 3. Pick a build and settings
 
-- **Emulator build:** v0.10.1 is the default. Older builds download when you pick them.
-- **Resolution:** 1440p is the default. 4K at 100% render scale needs a lot of video memory.
-- **Render scale:** lower is faster. 67% is the default.
-- **Display:** windowed or fullscreen.
+- **Emulator build:** v0.20.0 is the default. Older builds download when you pick them.
+- **Graphics tab:** 1440p windowed is the default. The upscaler is the game's own FSR 2 at Quality (67% render
+  scale). DLSS (GeForce RTX cards) and XeSS (most cards) are the other choices. Lower quality is faster. 4K with the
+  upscaler off needs a lot of video memory.
 
 ## 4. Play
 
@@ -29,7 +29,8 @@ Plug in a controller first, then press **Play NHL 27**. The first arena load stu
 shaders compile; after that the shader cache is warm. Close the game window when you're done.
 
 Keyboard: J = Cross, L = Circle, I = Triangle, K = Square, arrow keys = D-pad, WASD = left stick, Enter = Options,
-Q / E = L1 / R1.
+Q / E = L1 / R1. To change any key or controller button, open Faceoff's **Controls** tab: click a box, then press
+the key or button you want.
 
 ## If something goes wrong
 

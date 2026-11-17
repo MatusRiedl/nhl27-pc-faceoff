@@ -22,10 +22,12 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
   **Play NHL 27**. Faceoff checks the game, the emulator and the shader cache and shows a check mark for each.
 - ⚡ **A tuned emulator.** NHL 27 runs on our build of [duy64/KytyPS5-nhl](https://github.com/duy64/KytyPS5-nhl), a
   KytyPS5 fork: the game's own frame pacing (30 fps menus, 60 fps play), PGO and AVX2 builds, and fixes for Be a Pro
-  crashes and broken images. v0.10 adds smoother play: batched memory faults and locks that stop burning the CPU.
-- 🔀 **Pick your build.** v0.10.1, v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
+  crashes and broken images. v0.10 added smoother play (batched memory faults, locks that stop burning the CPU);
+  v0.20 adds a retrained speed profile, lazy shared writes at every frame rate and pipelines built at start-up.
+- 🔀 **Pick your build.** v0.20.0, v0.10.1, v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
   and is checked against its SHA-256.
-- 🎛 **Settings in one place.** Resolution (720p to 4K), windowed or fullscreen, render scale and trophy pop-ups.
+- 🎛 **Graphics tab.** Resolution (720p to 4K), windowed or fullscreen, the upscaler (the game's own FSR 2, NVIDIA
+  DLSS or Intel XeSS) with quality presets, sharpening, and an Advanced section. Trophy pop-ups on the Play tab.
 - 🔄 **Updates itself.** Faceoff checks for a new release when it starts and installs it in one click.
 - 🔒 **Your saves stay put.** Saves, trophies and the shader cache live next to `Faceoff.exe`, shared by every build.
   Updates never touch them.
@@ -40,7 +42,7 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
 
 ## 🚀 Get started
 
-1. Download `Faceoff-v0.10.1.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
+1. Download `Faceoff-v0.20.0.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
    to (not inside `Program Files`, at least 2 GB free).
 2. Start `Faceoff.exe`. Windows SmartScreen warns because the exe is not signed: choose **More info**, then
    **Run anyway**.
@@ -49,7 +51,7 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
    that happens once.
 
 **Coming from RC5:** Faceoff offers the update by itself and keeps your saves and shader cache. Take the new
-`Faceoff.exe` from the release once by hand: RC5's launcher reads 0.10.x as older. From v0.10.0, everything updates by itself.
+`Faceoff.exe` out of the release zip once and put it over the old one: RC5's launcher reads 0.10.x and later as older. From v0.10.0 on, everything updates by itself.
 
 Step by step, with controls and troubleshooting: [QUICKSTART.md](QUICKSTART.md).
 
@@ -57,7 +59,8 @@ Step by step, with controls and troubleshooting: [QUICKSTART.md](QUICKSTART.md).
 
 - Windows 10 or 11, 64-bit.
 - A CPU with AVX2 (Intel Haswell / AMD Zen or newer). Without AVX2 the game won't start.
-- About 14 GB of free RAM and 10 GB of video memory at 1440p.
+- About 14 GB of free RAM and 10 GB of video memory at 1440p. Windows also needs room to commit 24-28 GB for the
+  emulator in a match (RAM plus pagefile), so keep the pagefile system-managed and close other large apps.
 - The latest Microsoft Visual C++ Redistributable (x64) and a current GPU driver.
 - Your own dump of NHL 27: **PPSA34063, tested with 01.003.001**.
 
@@ -103,8 +106,10 @@ duy64 (KytyPS5-nhl and its NHL 27 fixes), nmzik, TheCruZ, Artyom Zabroda, superk
 [KytyPS5](https://github.com/KytyPS5/KytyPS5) authors, on top of the original [Kyty](https://github.com/InoriRus/Kyty).
 AnyPS5 (boykopovar) was used as a reference only; no code was copied from it.
 
-Upscaling SDKs (binaries only, under their own licences in `licenses/`): NVIDIA DLSS SDK 310.9.16 (DLSS Super
-Resolution via NGX, (c) NVIDIA Corporation) and Intel XeSS SDK 3.0.2 (XeSS Super Resolution, (c) Intel Corporation).
+Upscaling SDKs (binaries only, under their own licences; the texts are in `builds/rc8/licenses/` in the release zip):
+Intel XeSS SDK 3.0.2 (XeSS Super Resolution, (c) Intel Corporation, `libxess.dll`) and the NVIDIA DLSS SDK 310.9.16
+NGX library, (c) NVIDIA Corporation, linked into the emulator, with its `nvngx_dlss.dll`. DLSS needs a GeForce RTX
+card and a recent NVIDIA driver.
 NVIDIA, DLSS, Intel and XeSS are trademarks of their owners; this project is not affiliated with or endorsed by them.
 
 The changes, measurements and notes were made with an AI coding assistant (Claude) driving the builds, test runs and
@@ -119,4 +124,5 @@ belong to their owners. No money is made from this project.
 ## License
 
 The emulator is [GPL-2.0](LICENSE); bundled libraries' licences are in `licenses/` in the release zip. The source of
-each release is attached to it as `*-src.zip` and tagged in this repository.
+each release is tagged in this repository (the release page's "Source code" downloads); releases up to v0.10.1 also
+attach it as `*-src.zip`.
