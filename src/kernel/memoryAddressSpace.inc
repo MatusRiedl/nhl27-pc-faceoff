@@ -976,6 +976,9 @@ public:
 		m_granularity = info.dwAllocationGranularity;
 #endif
 		::Libs::Graphics::NvxSelfTest("M2_prereserve");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		::Libs::Graphics::DlssWarmUp();
+#endif
 		ReserveGuestRegions();
 		{
 			uint64_t owned = 0;
@@ -1221,7 +1224,11 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		const bool ok = FindContaining(vaddr, size) != m_free.end();
+		if (!ok) {
+			NoteOutsideOwned("reserve-fixed", vaddr, size);
+		}
+		return ok;
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1377,9 +1384,28 @@ private:
 		return true;
 	}
 
+	// Logs (the first 32 times) a guest request for a fixed range that lies outside the address space the guest
+	// reserved at start-up, e.g. in a span another component took first (the CUDA range of DlssWarmUp).
+	void NoteOutsideOwned(const char* op, uint64_t vaddr, uint64_t size) const {
+		const bool owned = UINT64_MAX - vaddr >= size &&
+		                   std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
+			                   return vaddr >= range.first && vaddr + size <= range.first + range.second;
+		                   });
+		static std::atomic<int> printed {0};
+		if (!owned && printed.fetch_add(1) < 32) {
+			std::printf("NHL27GUESTVA outside-owned op=%s vaddr=0x%016llx size=0x%llx\n", op,
+			            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+			std::fflush(stdout);
+		}
+	}
+
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
 		auto it = FindContaining(vaddr, size);
-		if (it == m_free.end() || !SplitUnlocked(it, vaddr, size)) {
+		if (it == m_free.end()) {
+			NoteOutsideOwned("map", vaddr, size);
+			return false;
+		}
+		if (!SplitUnlocked(it, vaddr, size)) {
 			return false;
 		}
 		it = m_free.find(vaddr);
@@ -1524,6 +1550,18 @@ private:
 					}
 					AddFreeUnlocked(reserve_start, reserve_end - reserve_start);
 					m_owned.emplace_back(reserve_start, reserve_end - reserve_start);
+				}
+				// Spans someone else holds inside the guest ranges (the exe, heaps, the CUDA range DlssWarmUp
+				// leaves). Only the large ones: a guest request there cannot be served.
+				if (const auto span_start = std::max(region_base, guest_start);
+				    info.State != MEM_FREE && region_end > span_start && region_end - span_start >= MinimumRegionSize) {
+					std::printf("NHL27GUESTVA skipped base=0x%016llx size_mib=%llu state=0x%lx type=0x%lx "
+					            "alloc_base=0x%016llx\n",
+					            static_cast<unsigned long long>(span_start),
+					            static_cast<unsigned long long>((region_end - span_start) >> 20u),
+					            static_cast<unsigned long>(info.State), static_cast<unsigned long>(info.Type),
+					            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(info.AllocationBase)));
+					std::fflush(stdout);
 				}
 
 				if (region_end <= next_addr) {

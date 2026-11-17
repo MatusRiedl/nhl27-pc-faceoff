@@ -31,6 +31,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1204,16 +1205,13 @@ static void VulkanCheckInstanceVersion() {
 // KYTY_NVX_SELFTEST=<point>|all (diagnostic): at that start-up point, create a throwaway Vulkan instance and a bare
 // device on the NVIDIA GPU with the extensions DLSS needs (VK_NVX_binary_import among them) and print the result.
 // Finds the start-up step after which the driver refuses VK_NVX_binary_import.
-void NvxSelfTest(const char* where) {
-	const char* want = std::getenv("KYTY_NVX_SELFTEST");
-	if (want == nullptr || (std::strcmp(want, "all") != 0 && std::strcmp(want, where) != 0)) {
-		return;
-	}
+static void NvxThrowawayDevice(const char* tag, const char* where) {
+	const auto        start = std::chrono::steady_clock::now();
 	SDL_SharedObject* lib = SDL_LoadObject("vulkan-1.dll");
 	auto gipa = lib != nullptr ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_LoadFunction(lib, "vkGetInstanceProcAddr"))
 	                           : nullptr;
 	if (gipa == nullptr) {
-		std::printf("NHL27NVXTEST where=%s no vulkan-1.dll\n", where);
+		std::printf("%s where=%s no vulkan-1.dll\n", tag, where);
 		std::fflush(stdout);
 		return;
 	}
@@ -1282,8 +1280,33 @@ void NvxSelfTest(const char* where) {
 		}
 		destroy_inst(inst, nullptr);
 	}
-	std::printf("NHL27NVXTEST where=%s instance=%d device=%d\n", where, static_cast<int>(ri), static_cast<int>(rd));
+	const auto us =
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+	std::printf("%s where=%s instance=%d device=%d us=%lld\n", tag, where, static_cast<int>(ri), static_cast<int>(rd),
+	            static_cast<long long>(us));
 	std::fflush(stdout);
+}
+
+void NvxSelfTest(const char* where) {
+	const char* want = std::getenv("KYTY_NVX_SELFTEST");
+	if (want == nullptr || (std::strcmp(want, "all") != 0 && std::strcmp(want, where) != 0)) {
+		return;
+	}
+	NvxThrowawayDevice("NHL27NVXTEST", where);
+}
+
+// DLSS on the rendering device needs VK_NVX_binary_import, which the NVIDIA driver backs with CUDA. CUDA reserves
+// address space of its own the first time such a device is created, and vkCreateDevice fails with
+// VK_ERROR_INITIALIZATION_FAILED once the guest address space has placeholder-reserved the ranges it wants (bisected:
+// fine right before GuestAddressSpace::ReserveGuestRegions, failing right after). Called right before that
+// reservation: one throwaway device lets CUDA take its range first, and it keeps it for the process. The guest
+// then owns less address space (about 66 GiB on an RTX 5080), so this runs only with KYTY_DLSS=1 in a DLSS build;
+// KYTY_DLSS_WARMUP=0 skips it.
+void DlssWarmUp() {
+	if (!DlssEarlyWarmUpWanted()) {
+		return;
+	}
+	NvxThrowawayDevice("NHL27DLSS warmup", "guest-reserve");
 }
 
 void WindowContext::CreateVulkan() {
@@ -1408,6 +1431,7 @@ void WindowContext::CreateVulkan() {
 	}
 	surface = native_surface;
 
+	std::vector<const char*> ngx_extensions; // what the DLSS bridge appended, for the retry below
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -1512,7 +1536,10 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			// The list above may already hold it: enable it once.
+			if (!HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			}
 			graphic_ctx.conditional_rendering_enabled = true;
 		}
 #if defined(_WIN32)
@@ -1542,8 +1569,11 @@ void WindowContext::CreateVulkan() {
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 		// DLSS bridge (KYTY_DLSS=1): NGX needs its own device extensions on the
 		// rendering device (no-op otherwise).
+		const size_t before_ngx = device_extensions.size();
 		DlssAppendDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions,
 		                           device_extensions);
+		ngx_extensions.assign(device_extensions.begin() + static_cast<std::ptrdiff_t>(before_ngx),
+		                      device_extensions.end());
 	}
 
 	// KYTY_VK_DEVICE_DEDUP=1: enable each device extension once (the list can repeat one).
@@ -1573,6 +1603,16 @@ void WindowContext::CreateVulkan() {
 	std::printf("NHL27DEVICE create begin extensions=%zu\n", device_extensions.size());
 	std::fflush(stdout);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	if (graphic_ctx.device == nullptr && !ngx_extensions.empty()) {
+		// The extensions DLSS asked for can still make creation fail (see DlssWarmUp). The game runs fine on its own
+		// upscaler chain without them: drop them, turn DLSS off for this session and try once more.
+		std::printf("NHL27DLSS device creation failed with %zu NGX extensions, retrying without them\n",
+		            ngx_extensions.size());
+		std::fflush(stdout);
+		std::erase_if(device_extensions, [&](const char* ext) { return HasExtension(ngx_extensions, ext); });
+		DlssDisable();
+		graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	}
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
 	}

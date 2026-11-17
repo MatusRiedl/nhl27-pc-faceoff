@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,11 @@
 #endif
 
 namespace Libs::Graphics {
+
+namespace {
+// Set when the rendering device had to be created without NGX's extensions: no DLSS this session.
+std::atomic<bool> g_dlss_disabled {false};
+} // namespace
 
 #if KYTY_DLSS_BRIDGE
 namespace {
@@ -147,7 +153,7 @@ constexpr std::array<VkFormat, DlssBridge::Count> kFormats = {VK_FORMAT_B10G11R1
 // directly: window creation happens before any bridge exists.
 bool DlssWanted() {
 	const char* value = std::getenv("KYTY_DLSS");
-	return value != nullptr && std::strcmp(value, "1") == 0;
+	return !g_dlss_disabled.load() && value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 // The one NGX feature description shared by the window-creation extension queries
@@ -667,7 +673,11 @@ struct DlssBridge::Impl {
 
 DlssBridge::DlssBridge(GraphicContext& graphics): m(std::make_unique<Impl>(graphics)) {
 #if KYTY_DLSS_BRIDGE
-	m->Init();
+	if (g_dlss_disabled.load()) {
+		m->Fail("the Vulkan device was created without the NGX extensions");
+	} else {
+		m->Init();
+	}
 #else
 	m->Fail("build without KYTY_ENABLE_DLSS (Windows only)");
 #endif
@@ -755,16 +765,14 @@ namespace {
 // not already enabled (the filter upstream KytyPS5's DLSS applies to the same
 // lists). The strings point into NGX's own storage and stay valid for the process.
 // Names never appended. KYTY_DLSS_VK_SKIP_EXT=<name>[,<name>...] replaces the list
-// ("none" = skip nothing). Default: every device extension NGX asked for on an RTX 5080
-// (driver 2026-11): enabling VK_NVX_binary_import on our device crashes inside
-// vkCreateDevice (0xC0000005, v020j boots), and without it NGX reports DLSS unavailable,
-// so the bridge falls back to the game's chain instead of crashing the boot.
-// VK_EXT_buffer_device_address must never be enabled next to the core bufferDeviceAddress.
+// ("none" = skip nothing). Default: VK_EXT_buffer_device_address only, which must never be
+// enabled next to the core bufferDeviceAddress. VK_NVX_binary_import used to fail device
+// creation (VK_ERROR_INITIALIZATION_FAILED): the guest address-space reservation had taken the
+// range CUDA wants. DlssWarmUp() now runs before that reservation, and window creation retries
+// without these extensions (DLSS off for the session) if the device still fails.
 bool NgxExtensionSkipped(const char* name) {
 	const char* env  = std::getenv("KYTY_DLSS_VK_SKIP_EXT");
-	const char* list = env != nullptr ? env
-	                                    : "VK_EXT_buffer_device_address,VK_KHR_buffer_device_address,"
-	                                      "VK_NVX_binary_import,VK_NVX_image_view_handle";
+	const char* list = env != nullptr ? env : "VK_EXT_buffer_device_address";
 	const size_t len = std::strlen(name);
 	for (const char* p = list; *p != '\0';) {
 		const char* end = std::strchr(p, ',');
@@ -857,6 +865,19 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
 	(void)available;
 	(void)extensions;
 #endif
+}
+
+bool DlssEarlyWarmUpWanted() {
+#if KYTY_DLSS_BRIDGE
+	const char* warm = std::getenv("KYTY_DLSS_WARMUP");
+	return DlssWanted() && (warm == nullptr || warm[0] != '0');
+#else
+	return false;
+#endif
+}
+
+void DlssDisable() {
+	g_dlss_disabled.store(true);
 }
 
 } // namespace Libs::Graphics

@@ -57,6 +57,7 @@
 
 namespace Libs::Graphics {
 void NvxSelfTest(const char* where);
+void DlssWarmUp();
 } // namespace Libs::Graphics
 
 namespace Libs::LibKernel::Memory {
