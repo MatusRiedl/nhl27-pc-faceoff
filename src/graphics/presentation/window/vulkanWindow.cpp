@@ -1201,6 +1201,91 @@ static void VulkanCheckInstanceVersion() {
 	}
 }
 
+// KYTY_NVX_SELFTEST=<point>|all (diagnostic): at that start-up point, create a throwaway Vulkan instance and a bare
+// device on the NVIDIA GPU with the extensions DLSS needs (VK_NVX_binary_import among them) and print the result.
+// Finds the start-up step after which the driver refuses VK_NVX_binary_import.
+void NvxSelfTest(const char* where) {
+	const char* want = std::getenv("KYTY_NVX_SELFTEST");
+	if (want == nullptr || (std::strcmp(want, "all") != 0 && std::strcmp(want, where) != 0)) {
+		return;
+	}
+	SDL_SharedObject* lib = SDL_LoadObject("vulkan-1.dll");
+	auto gipa = lib != nullptr ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_LoadFunction(lib, "vkGetInstanceProcAddr"))
+	                           : nullptr;
+	if (gipa == nullptr) {
+		std::printf("NHL27NVXTEST where=%s no vulkan-1.dll\n", where);
+		std::fflush(stdout);
+		return;
+	}
+	auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
+	const char*       inst_ext[] = {"VK_KHR_get_physical_device_properties2"};
+	VkApplicationInfo app {};
+	app.sType      = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	app.apiVersion = VK_API_VERSION_1_3;
+	VkInstanceCreateInfo ici {};
+	ici.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	ici.pApplicationInfo        = &app;
+	ici.enabledExtensionCount   = 1;
+	ici.ppEnabledExtensionNames = inst_ext;
+	VkInstance inst      = VK_NULL_HANDLE;
+	const VkResult ri    = create_instance(&ici, nullptr, &inst);
+	VkResult       rd    = VK_RESULT_MAX_ENUM;
+	if (ri == VK_SUCCESS) {
+		auto enum_pd   = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(inst, "vkEnumeratePhysicalDevices"));
+		auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa(inst, "vkGetPhysicalDeviceProperties"));
+		auto get_qf    = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties"));
+		auto create_device  = reinterpret_cast<PFN_vkCreateDevice>(gipa(inst, "vkCreateDevice"));
+		auto destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(gipa(inst, "vkDestroyDevice"));
+		auto destroy_inst   = reinterpret_cast<PFN_vkDestroyInstance>(gipa(inst, "vkDestroyInstance"));
+		uint32_t         n = 8;
+		VkPhysicalDevice pds[8] {};
+		enum_pd(inst, &n, pds);
+		VkPhysicalDevice pd = VK_NULL_HANDLE;
+		for (uint32_t i = 0; i < n && pd == VK_NULL_HANDLE; i++) {
+			VkPhysicalDeviceProperties p {};
+			get_props(pds[i], &p);
+			if (p.vendorID == 0x10de) {
+				pd = pds[i];
+			}
+		}
+		if (pd != VK_NULL_HANDLE) {
+			uint32_t                qn = 16;
+			VkQueueFamilyProperties qf[16] {};
+			get_qf(pd, &qn, qf);
+			uint32_t fam = 0;
+			for (uint32_t i = 0; i < qn; i++) {
+				if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+					fam = i;
+					break;
+				}
+			}
+			const float             prio = 1.0f;
+			VkDeviceQueueCreateInfo qci {};
+			qci.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+			qci.queueFamilyIndex = fam;
+			qci.queueCount       = 1;
+			qci.pQueuePriorities = &prio;
+			const char* dev_ext[] = {"VK_KHR_push_descriptor", "VK_NVX_image_view_handle",
+			                         "VK_KHR_buffer_device_address", "VK_NVX_binary_import"};
+			VkDeviceCreateInfo dci {};
+			dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+			dci.queueCreateInfoCount    = 1;
+			dci.pQueueCreateInfos       = &qci;
+			dci.enabledExtensionCount   = 4;
+			dci.ppEnabledExtensionNames = dev_ext;
+			VkDevice dev = VK_NULL_HANDLE;
+			rd           = create_device(pd, &dci, nullptr, &dev);
+			if (rd == VK_SUCCESS) {
+				destroy_device(dev, nullptr);
+			}
+		}
+		destroy_inst(inst, nullptr);
+	}
+	std::printf("NHL27NVXTEST where=%s instance=%d device=%d\n", where, static_cast<int>(ri), static_cast<int>(rd));
+	std::fflush(stdout);
+}
+
 void WindowContext::CreateVulkan() {
 	EXIT_IF(window == nullptr);
 	EXIT_IF(graphic_ctx.instance != nullptr);
@@ -1215,7 +1300,9 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
+	NvxSelfTest("T5_window");
 	Vr::OpenXrInit();
+	NvxSelfTest("T6_openxr");
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
@@ -1482,6 +1569,7 @@ void WindowContext::CreateVulkan() {
 			std::printf("NHL27DEVICE extension %s\n", ext);
 		}
 	}
+	NvxSelfTest("T7_device");
 	std::printf("NHL27DEVICE create begin extensions=%zu\n", device_extensions.size());
 	std::fflush(stdout);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);

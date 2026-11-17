@@ -32,6 +32,10 @@
 #include <filesystem>
 #include <thread>
 
+namespace Libs::Graphics {
+void NvxSelfTest(const char* where);
+} // namespace Libs::Graphics
+
 namespace Emulator {
 
 static void PrintSystemInfo() {
@@ -114,7 +118,9 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
+	::Libs::Graphics::NvxSelfTest("T2_premem");
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+	::Libs::Graphics::NvxSelfTest("T3_mem");
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
@@ -198,6 +204,7 @@ void Run(const RunOptions& options) {
 	Libs::InitAll(rt->Symbols());
 
 	LoadElf(options.elf);
+	::Libs::Graphics::NvxSelfTest("T4_elf");
 
 	Execute(options.game_patch);
 }

@@ -554,9 +554,15 @@ static void StartProfileWriter() {
 }
 #endif
 
+namespace Libs::Graphics {
+void NvxSelfTest(const char* where);
+} // namespace Libs::Graphics
+
 static int Main(int argc, char* argv[]) {
+	Libs::Graphics::NvxSelfTest("T0_main");
 	VirtualMemory::Init();
 	InitializeThreads();
+	Libs::Graphics::NvxSelfTest("T1_threads");
 #if defined(KYTY_PGO_GENERATE)
 	StartProfileWriter();
 #endif
