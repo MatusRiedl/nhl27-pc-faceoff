@@ -24,10 +24,11 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
   KytyPS5 fork: the game's own frame pacing (30 fps menus, 60 fps play), PGO and AVX2 builds, and fixes for Be a Pro
   crashes and broken images. v0.10 added smoother play (batched memory faults, locks that stop burning the CPU);
   v0.20 adds a retrained speed profile, lazy shared writes at every frame rate and pipelines built at start-up.
-- 🔀 **Pick your build.** v0.20.0, v0.10.1, v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
+- 🔀 **Pick your build.** v0.20.1, v0.20.0, v0.10.1, v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
   and is checked against its SHA-256.
-- 🎛 **Graphics tab.** Resolution (720p to 4K), windowed or fullscreen, the upscaler (the game's own FSR 2, NVIDIA
-  DLSS or Intel XeSS) with quality presets, sharpening, and an Advanced section. Trophy pop-ups on the Play tab.
+- 🎛 **Graphics tab.** Resolution (720p to 4K; the game renders a share of it, so lower is faster), windowed or
+  fullscreen, Keep 16:9 or Stretch on an ultrawide or 4:3 screen, the upscaler (the game's own FSR 2, NVIDIA DLSS or
+  Intel XeSS) with quality presets, sharpening, and an Advanced section. Trophy pop-ups on the Play tab.
 - 🔄 **Updates itself.** Faceoff checks for a new release when it starts and installs it in one click.
 - 🔒 **Your saves stay put.** Saves, trophies and the shader cache live next to `Faceoff.exe`, shared by every build.
   Updates never touch them.

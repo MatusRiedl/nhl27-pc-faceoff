@@ -2,6 +2,42 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
+## v0.20.1
+
+- 🛠️ **DLSS no longer closes the game at start on some RTX cards.** Before the game reserved its memory, the DLSS
+  start-up step let the NVIDIA driver place its own memory over an address the game needs, and the game closed right
+  after the splash screen. The emulator now reserves the game's low memory first, so the driver goes elsewhere. If
+  DLSS still closes the game on your card, please send the play log.
+- 🖥️ **Ultrawide and 4:3 screens: no more stretching.** The game's 16:9 picture is now centred with black bars on a
+  screen of another shape (21:9, 32:9, 4:3, 16:10). A window within about 9 % of 16:9 (a 1440p window that lost its
+  title bar and taskbar height) is still filled edge to edge. Faceoff → Graphics → **Aspect ratio**: Keep 16:9 (the
+  new default) or Stretch (the old look). Mouse and touch-pad positions follow the picture. This applies in windowed
+  mode too: the window opens maximized, so on a 21:9 monitor it is 21:9 as well. Works with sharpening and with
+  DLSS. `KYTY_PRESENT_STRETCH=1` brings the stretch back without Faceoff.
+- 🎚️ **Resolution now changes what the game renders.**
+  - Quality presets are a share of the resolution you pick. 1440p is unchanged. 1080p Quality now renders 1280×720
+    (before, it rendered the same as 1440p), so lower resolutions really run lighter.
+  - **4K Quality is now a real 4K Quality:** it renders 2560×1440 and the game upscales to 3840×2160. That's heavier
+    than before (it rendered 1708×960), so expect lower fps and more video memory at 4K. In our test on an RTX 5080
+    the GPU ran near its limit, play held about 59 fps, and the card's memory use peaked at about 11.4 GB (desktop
+    included; measured in a 1440p window). If your card struggles, pick Balanced or Performance.
+  - **Off** means "render at your resolution". The most the game renders is 2560×1440, and the caption says so.
+  - The render-scale slider (Advanced) is now "% of your resolution". A custom scale you saved before converts once
+    to the same render size.
+  - The caption under Quality shows the real chain, e.g. "Renders 1280×720 · game upscales to 1920×1080 · shown at
+    1920×1080".
+- **Known:**
+  - Some players see RC3 run faster than v0.20.0 with the same settings (about 60 against 48 fps at faceoffs). On
+    our test PC the gap is under 1 fps on average, even with the GPU at its limit, so the cause isn't found yet and
+    v0.20.1 doesn't claim to fix it. If you see it, please send a play log from RC3 and one from v0.20.1 (Faceoff →
+    Log), plus the Last session line.
+  - Sharpening above 0 % costs more on v0.20.x than on RC3-RC7: below a 4K window the newer builds downscale the
+    game's 4K picture and then sharpen it, where the older ones skipped sharpening. On a GPU that is already at its
+    limit, set sharpening to 0 % to compare.
+  - Rarely, play drops to a few fps for 10-30 s and then recovers. It is not new (v0.20.0 has it too). If you hit
+    it, the play log helps.
+- **Updating:** Faceoff updates itself to 0.20.1 and offers the new build (v0.20.1). Saves and the shader cache stay.
+
 ## v0.20.0
 
 - ⚡ **Faster draw path.** The emulator's speed profile (PGO) had gone stale: v0.10.x threw it away on 41 of its
