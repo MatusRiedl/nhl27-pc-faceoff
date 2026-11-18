@@ -18,10 +18,12 @@ Press **Browse** on the Play tab and pick your NHL 27 folder, the one that holds
 
 ## 3. Pick a build and settings
 
-- **Emulator build:** v0.20.0 is the default. Older builds download when you pick them.
-- **Graphics tab:** 1440p windowed is the default. The upscaler is the game's own FSR 2 at Quality (67% render
-  scale). DLSS (GeForce RTX cards) and XeSS (most cards) are the other choices. Lower quality is faster. 4K with the
-  upscaler off needs a lot of video memory.
+- **Emulator build:** v0.20.1 is the default. Older builds download when you pick them.
+- **Graphics tab:** 1440p windowed is the default. The upscaler is the game's own FSR 2 at Quality (it renders 67%
+  of your resolution). DLSS (GeForce RTX cards) and XeSS (most cards) are the other choices. A lower resolution or a
+  lower quality is faster. 4K Quality renders 2560×1440 and needs a strong card; Balanced or Performance is lighter.
+- **Ultrawide or 4:3 screen:** the picture keeps 16:9 with black bars. **Aspect ratio → Stretch** fills the screen
+  instead.
 
 ## 4. Play
 

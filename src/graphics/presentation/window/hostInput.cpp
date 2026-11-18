@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/presentRect.h"
 #include "libs/controller.h"
 
 #include <algorithm>
@@ -474,8 +475,9 @@ void RecordMouseTouchPadPosition(float x, float y) {
 		SDL_GetWindowSize(g_mouse_window, &width, &height);
 	}
 	if (width > 0 && height > 0) {
-		x = std::clamp(x / static_cast<float>(width), 0.0f, 1.0f);
-		y = std::clamp(y / static_cast<float>(height), 0.0f, 1.0f);
+		// Through the image's rect: with black bars (keep 16:9) the bars map to the image's edge.
+		x = PresentMapX(std::clamp(x / static_cast<float>(width), 0.0f, 1.0f));
+		y = PresentMapY(std::clamp(y / static_cast<float>(height), 0.0f, 1.0f));
 	} else {
 		x = 0.5f;
 		y = 0.5f;
