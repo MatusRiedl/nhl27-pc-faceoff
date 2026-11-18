@@ -29,7 +29,7 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
 - 🎛 **Graphics tab.** Resolution (720p to 4K; the game renders a share of it, so lower is faster), windowed or
   fullscreen, Keep 16:9 or Stretch on an ultrawide or 4:3 screen, the upscaler (the game's own FSR 2, NVIDIA DLSS or
   Intel XeSS) with quality presets, sharpening, and an Advanced section. Trophy pop-ups on the Play tab.
-- 🔄 **Updates itself.** Faceoff checks for a new release when it starts and installs it in one click.
+- 🔄 **Updates itself.** Faceoff checks for a new release at every start and every 30 minutes, then installs it and restarts by itself.
 - 🔒 **Your saves stay put.** Saves, trophies and the shader cache live next to `Faceoff.exe`, shared by every build.
   Updates never touch them.
 - 🧾 **Crash reports one click away.** After a crash Faceoff shows the play log, jumps to the error and copies it for
@@ -43,7 +43,7 @@ Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
 
 ## 🚀 Get started
 
-1. Download `Faceoff-v0.20.0.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
+1. Download `Faceoff-v0.20.2.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
    to (not inside `Program Files`, at least 2 GB free).
 2. Start `Faceoff.exe`. Windows SmartScreen warns because the exe is not signed: choose **More info**, then
    **Run anyway**.
