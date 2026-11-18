@@ -2,6 +2,22 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
+## v0.20.2
+
+- 🔄 **Faceoff updates itself.** When a new release is on GitHub, Faceoff downloads it, installs the new emulator
+  build, selects it and restarts, with no click. It checks at every start and every 30 minutes while it's open.
+  - While the game is running it waits, and finishes after you close the game.
+  - If Faceoff is in the background, it restarts when you click back into it, so no window pops up over something
+    else.
+  - A release that only changes Faceoff downloads just Faceoff.exe (about 20 MB), not the whole zip.
+  - **Later** puts the update off until the next start. If an update fails 3 times, Faceoff stops trying on its own
+    and shows the error with an **Update** button.
+  - Saves and the shader cache are kept. Click the version number at the bottom right to check now.
+- **Coming from v0.20.1 or older:** the old Faceoff shows this update when you start it (it asks GitHub at most
+  every 6 hours, so restart it later if it doesn't show yet). Click **Update** once. Every update after this one is
+  automatic.
+- The emulator build is the same as v0.20.1.
+
 ## v0.20.1
 
 - 🛠️ **DLSS no longer closes the game at start on some RTX cards.** Before the game reserved its memory, the DLSS
