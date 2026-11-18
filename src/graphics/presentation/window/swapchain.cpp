@@ -21,6 +21,7 @@
 #include "graphics/presentation/fsr/fsr1.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/presentRect.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
@@ -325,6 +326,9 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	std::vector<std::unique_ptr<Fsr1>> m_fsr1;
 	std::string m_fsr1_status;
+	// Where the game image goes this frame (presentRect.h): the whole image, or a centred 16:9 box with bars.
+	vk::Rect2D  m_content {};
+	std::string m_content_status;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -794,10 +798,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
 	command.beginRendering(&rendering);
-	const vk::Viewport viewport {
-	    0.0f, 0.0f, static_cast<float>(m_extent.width), static_cast<float>(m_extent.height),
-	    0.0f, 1.0f};
-	const vk::Rect2D scissor {{0, 0}, m_extent};
+	// The game's overlay plane goes where the game image went (the 16:9 box when the window has bars).
+	const vk::Rect2D   scissor = m_content.extent.width != 0 ? m_content : vk::Rect2D {{0, 0}, m_extent};
+	const vk::Viewport viewport {static_cast<float>(scissor.offset.x), static_cast<float>(scissor.offset.y),
+	                             static_cast<float>(scissor.extent.width), static_cast<float>(scissor.extent.height),
+	                             0.0f, 1.0f};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
@@ -814,6 +819,24 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
 	vk::Image blit_source = source ? source->image.image : vk::Image {};
 	vk::Extent2D blit_extent = source ? vk::Extent2D {source->image.extent.width, source->image.extent.height} : vk::Extent2D {};
+	// Keep the game's aspect (16:9) in a window of another shape: a centred box, black bars (presentRect.h).
+	const PresentRect content = ComputePresentRect(m_extent.width, m_extent.height, blit_extent.width,
+	                                               blit_extent.height, PresentStretchWanted());
+	const vk::Extent2D content_extent {content.width, content.height};
+	const bool         bars = content.width != m_extent.width || content.height != m_extent.height;
+	m_content               = vk::Rect2D {{static_cast<int32_t>(content.x), static_cast<int32_t>(content.y)}, content_extent};
+	if (source != nullptr) {
+		PublishPresentRect(content, m_extent.width, m_extent.height);
+		auto status = fmt::format("window={}x{} source={}x{} image={}x{}+{}+{} mode={}", m_extent.width,
+		                          m_extent.height, blit_extent.width, blit_extent.height, content.width,
+		                          content.height, content.x, content.y,
+		                          PresentStretchWanted() ? "stretch" : bars ? "keep-aspect-bars" : "keep-aspect-fills");
+		if (status != m_content_status) {
+			std::printf("NHL27PRESENT %s\n", status.c_str());
+			std::fflush(stdout);
+			m_content_status = std::move(status);
+		}
+	}
 	const bool fsr1_enabled = Common::RuntimeFlags::Current().fsr1;
 	if (!fsr1_enabled && !m_fsr1_status.empty()) {
 		std::printf("NHL27FSR version=1 status=disabled\n");
@@ -828,8 +851,9 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		// Up to the window size: EASU+RCAS (or RCAS alone at the same size). Larger than the window in
 		// both directions (the game's 4K output in a smaller window): downscale first, then RCAS at
 		// the window size, so the sharpening is not lost in the downscale.
-		const bool fits = blit_extent.width <= m_extent.width && blit_extent.height <= m_extent.height;
-		const bool shrinks = blit_extent.width >= m_extent.width && blit_extent.height >= m_extent.height;
+		// The target is the image's box in the window (the whole window unless it has bars).
+		const bool fits = blit_extent.width <= content_extent.width && blit_extent.height <= content_extent.height;
+		const bool shrinks = blit_extent.width >= content_extent.width && blit_extent.height >= content_extent.height;
 		std::string status = "fallback (HDR, format or aspect)";
 		if (!source->hdr && !m_hdr_active && !source->blank && sdr_format && (fits || shrinks)) {
 			if (m_fsr1.empty()) m_fsr1.resize(m_images.size());
@@ -852,17 +876,17 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 					RequireVulkanSuccess(m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view), "create FSR source view");
 				}
 				source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
-				output = fsr->Record(vk_command.Direct(), source->view, blit_extent, m_extent, sharpness);
+				output = fsr->Record(vk_command.Direct(), source->view, blit_extent, content_extent, sharpness);
 			} else {
 				source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
-				output = fsr->RecordDownscaled(vk_command.Direct(), source->image.image, blit_extent, m_extent, sharpness);
+				output = fsr->RecordDownscaled(vk_command.Direct(), source->image.image, blit_extent, content_extent, sharpness);
 			}
 			if (output) {
 				status = fmt::format("{} {}x{} -> {}x{} sharpness={:.2f}",
-				                     !fits ? "downscale+RCAS" : blit_extent == m_extent ? "RCAS" : "EASU+RCAS",
-				                     blit_extent.width, blit_extent.height, m_extent.width, m_extent.height, sharpness);
+				                     !fits ? "downscale+RCAS" : blit_extent == content_extent ? "RCAS" : "EASU+RCAS",
+				                     blit_extent.width, blit_extent.height, content_extent.width, content_extent.height, sharpness);
 				blit_source = output;
-				blit_extent = m_extent;
+				blit_extent = content_extent;
 			} else {
 				status = "fallback (FSR allocation or pipeline unavailable)";
 			}
@@ -900,6 +924,17 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
+	if (source != nullptr && bars) {
+		// Black bars: the parts of the window outside the image box must not show an older frame.
+		const vk::ClearColorValue black {};
+		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, &black, 1,
+		                           &to_transfer.subresourceRange);
+		vk::ImageMemoryBarrier cleared = to_transfer;
+		cleared.srcAccessMask          = vk::AccessFlagBits::eTransferWrite;
+		cleared.oldLayout              = vk::ImageLayout::eTransferDstOptimal;
+		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+		                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &cleared);
+	}
 	if (source != nullptr) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
@@ -913,8 +948,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstSubresource.mipLevel       = 0;
 		region.dstSubresource.baseArrayLayer = 0;
 		region.dstSubresource.layerCount     = 1;
-		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
-		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
+		region.dstOffsets[0].x               = static_cast<int>(content.x);
+		region.dstOffsets[0].y               = static_cast<int>(content.y);
+		region.dstOffsets[1].x               = static_cast<int>(content.x + content.width);
+		region.dstOffsets[1].y               = static_cast<int>(content.y + content.height);
 		region.dstOffsets[1].z               = 1;
 		vk_command.blitImage(blit_source, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,

@@ -596,6 +596,11 @@ add_executable(readback_window_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(readback_window_tests PRIVATE ${inc_headers})
 
+add_executable(present_rect_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PresentRectTests.cpp"
+)
+target_include_directories(present_rect_tests PRIVATE ${inc_headers})
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
