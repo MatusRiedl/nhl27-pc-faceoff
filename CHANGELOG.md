@@ -28,8 +28,8 @@ Newest first. Download: [the release page](../../releases/latest).
     1920×1080".
 - **Known:**
   - Some players see RC3 run faster than v0.20.0 with the same settings (about 60 against 48 fps at faceoffs). On
-    our test PC the gap is under 1 fps on average, even with the GPU at its limit, so the cause isn't found yet and
-    v0.20.1 doesn't claim to fix it. If you see it, please send a play log from RC3 and one from v0.20.1 (Faceoff →
+    our test PC the gap is under 1 fps at the default settings and up to 3 fps with the GPU at its limit, so the
+    cause isn't found yet and v0.20.1 doesn't claim to fix it. If you see it, please send a play log from RC3 and one from v0.20.1 (Faceoff →
     Log), plus the Last session line.
   - Sharpening above 0 % costs more on v0.20.x than on RC3-RC7: below a 4K window the newer builds downscale the
     game's 4K picture and then sharpen it, where the older ones skipped sharpening. On a GPU that is already at its
