@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/processExit.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1685,6 +1686,9 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
 
+	if (Common::TerminateOnExit()) {
+		Common::DbgExit(code); // ::exit ends in ExitProcess (common/processExit.h)
+	}
 	::exit(code);
 }
 

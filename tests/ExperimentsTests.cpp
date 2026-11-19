@@ -1,4 +1,5 @@
 #include "common/experiments.h"
+#include "common/threads.h"
 
 #include <chrono>
 #include <cstdio>
@@ -25,10 +26,59 @@ bool WaitForMask(uint64_t expected) {
 	} while (std::chrono::steady_clock::now() < until);
 	return false;
 }
+
+// Common::Thread::CompileWorkerCount (v0.30.0): cores - 2 clamped to 6..10, 6 when unknown,
+// KYTY_COMPILE_WORKERS=1..16 overrides, "0" is the old fixed 6, bad values keep the rule.
+bool CompileWorkerCountTests() {
+	using Common::Thread;
+	const auto topology = [](bool valid, uint32_t cores) {
+		Thread::CpuTopology result;
+		result.valid      = valid;
+		result.cores      = cores;
+		result.fast_cores = cores;
+		result.logical    = cores * 2;
+		return result;
+	};
+	struct Case {
+		bool        valid;
+		uint32_t    cores;
+		const char* env;
+		uint32_t    expected;
+		const char* rule;
+	};
+	const Case cases[] = {
+	    {false, 0, nullptr, 6, "unknown"}, {true, 0, nullptr, 6, "unknown"}, {true, 1, nullptr, 6, "cores"},
+	    {true, 4, nullptr, 6, "cores"},    {true, 6, nullptr, 6, "cores"},   {true, 8, nullptr, 6, "cores"},
+	    {true, 9, nullptr, 7, "cores"},    {true, 12, nullptr, 10, "cores"}, {true, 16, nullptr, 10, "cores"},
+	    {true, 24, nullptr, 10, "cores"},  {true, 16, "0", 6, "fixed"},      {true, 8, "1", 1, "env"},
+	    {true, 8, "16", 16, "env"},        {true, 8, "17", 6, "cores"},      {true, 8, "100", 6, "cores"},
+	    {true, 8, "-3", 6, "cores"},       {true, 8, "4x", 6, "cores"},      {true, 8, "", 6, "cores"},
+	    {false, 0, "12", 12, "env"},       {true, 12, "00", 6, "fixed"},     {true, 12, "08", 8, "env"},
+	};
+	for (const auto& test: cases) {
+		const char* rule  = "";
+		const auto  count = Thread::CompileWorkerCount(topology(test.valid, test.cores), test.env, &rule);
+		if (count != test.expected || std::string(rule) != test.rule) {
+			std::fprintf(stderr, "CompileWorkerCount(valid=%d cores=%u env=%s) = %u rule=%s, expected %u rule=%s\n",
+			             test.valid ? 1 : 0, test.cores, test.env != nullptr ? test.env : "(null)", count, rule,
+			             test.expected, test.rule);
+			return false;
+		}
+	}
+	// The rule out-parameter is optional.
+	if (Thread::CompileWorkerCount(topology(true, 12), nullptr) != 10) {
+		std::fprintf(stderr, "CompileWorkerCount without a rule pointer\n");
+		return false;
+	}
+	return true;
+}
 } // namespace
 
 int main() {
 	using namespace Common::Experiments;
+	if (!CompileWorkerCountTests()) {
+		return 1;
+	}
 	// Every experiment bit must have a unique value: six names shared bits
 	// 38-43 with other names before the 2026-10-27 fix, so setting one
 	// silently flipped the other. kAllBits lives in experiments.h (which also

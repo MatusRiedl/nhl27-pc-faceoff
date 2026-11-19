@@ -271,9 +271,25 @@ static const std::array<int, 7>& GpuStageCpus() {
 	// from core 0: the stages share its L3.
 	// The dispatch resolver (experiment DispatchResolver) on a sixth core, the second draw resolver
 	// (experiment DrawResolver) on a seventh.
+	// The picks are physical fast cores 2, 3, 4, 5, 1, 6 and 7 (first logical CPU of each), so
+	// a uniform CPU with adjacent SMT siblings keeps {4, 6, 8, 10, 2, 12, 14}; a stage whose
+	// core is missing (fewer fast cores) or is an E-core stays unpinned; and CPUs without SMT get
+	// real cores instead of pins that failed.
 	static const std::array<int, 7> cpus = [] {
 		std::array<int, 7> result {4, 6, 8, 10, 2, 12, 14};
-		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		const auto&        topology = Common::Thread::GetCpuTopology();
+		if (topology.valid) {
+			static constexpr std::array<uint32_t, 7> FastCore {2, 3, 4, 5, 1, 6, 7};
+			for (size_t stage = 0; stage < result.size(); stage++) {
+				result[stage] = FastCore[stage] < topology.fast_cores ? topology.fast_core_first[FastCore[stage]] : -1;
+			}
+		}
+		const char* value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		std::printf("NHL27CPU: %u logical CPUs, %u cores, %u fast%s%s; stage CPUs %d,%d,%d,%d,%d,%d,%d%s\n",
+		            topology.logical, topology.cores, topology.fast_cores, topology.hybrid ? " (hybrid)" : "",
+		            topology.valid ? "" : " (topology unknown)", result[0], result[1], result[2], result[3],
+		            result[4], result[5], result[6], value != nullptr ? " (KYTY_GPU_THREAD_CPUS overrides)" : "");
+		std::fflush(stdout);
 		if (value == nullptr) {
 			return result;
 		}

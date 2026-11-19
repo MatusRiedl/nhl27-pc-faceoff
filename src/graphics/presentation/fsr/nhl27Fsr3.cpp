@@ -3,6 +3,7 @@
 #include "graphics/presentation/fsr/fsr3.h"
 #include "graphics/presentation/fsr/fsr4Bridge.h"
 #include "graphics/presentation/fsr/dlssBridge.h"
+#include "graphics/presentation/fsr/frameGen.h"
 #include "graphics/presentation/fsr/xessBridge.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -794,6 +795,29 @@ struct Nhl27Fsr3::Impl {
 			SharedBarrier(recorder, output, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, ignored, ignored);
 			SharedBarrier(recorder, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
 		}
+		{
+			// DLSS frame generation (KYTY_DLSSG, frameGen.h): this frame's depth and motion vectors, back
+			// in their own layout after the copies above. The frame index is taken now, on the GPU thread
+			// before this frame's flip; the Streamline calls run where the commands reach Vulkan (at once,
+			// or at replay on the recording thread). Recorded before the flush below, which is followed by
+			// InvalidateRedundantBinds (Streamline may record its own commands here).
+			if (const FrameGen::TagReservation reservation = FrameGen::ReserveTag(captured); reservation.index != 0) {
+				constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+				                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+				                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+				const auto tag_image = [&](const Owned& owned) {
+					return FrameGen::TagImage {static_cast<VkImage>(owned.resource.image), owned.allocation,
+					                           static_cast<VkFormat>(owned.resource.format), render.width,
+					                           render.height, static_cast<VkImageLayout>(owned.layout), usage};
+				};
+				recorder.RecordExternal([context = &graphics, depth = tag_image(images[1]),
+				                         motion = tag_image(images[2]), constants = captured, reset = frame.reset,
+				                         reservation](vk::CommandBuffer native) {
+					FrameGen::TagUpscale(*context, static_cast<VkCommandBuffer>(native), depth, motion, constants,
+					                     reset, reservation);
+				});
+			}
+		}
 		const auto [inputs_ready, upscaled] = dlss_bridge->NextValues();
 		SubmitInfo signal {};
 		signal.AddSignal(dlss_bridge->Semaphore(), inputs_ready);
@@ -1308,6 +1332,7 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 			m->Reject("snapshot-layout"); return;
 		}
 		m->captured = c;
+		FrameGen::CameraScanConstants(c); // KYTY_DLSSG_CAMERA_SCAN: the projection to look for
 		for (size_t i = 0; i < 8; ++i) m->prepare[i] = Impl::Role::Of(b[i]);
 		m->stage = 1;
 		m->LogBindings(0, b);

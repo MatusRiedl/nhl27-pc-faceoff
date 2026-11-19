@@ -19,10 +19,13 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -312,6 +315,77 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// KYTY_ASYNC_COMPUTE_PIPELINES=1: compute pipelines a compile worker created right after it
+	// compiled their program, by program id, until the first dispatch of the program takes one.
+	// Workers create them with m_driver_cache_guard shared; Save() destroys the driver cache
+	// with it exclusive.
+	std::mutex                                              m_async_compute_mutex;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_async_compute_pipelines;
+	std::shared_mutex                                       m_driver_cache_guard;
+	std::atomic_uint64_t                                    m_async_compute_created {0};
+	std::atomic_uint64_t                                    m_async_compute_failed {0};
+	uint64_t                                                m_async_compute_adopted = 0; // execution thread
+	uint64_t                                                m_inline_compute_created = 0; // execution thread
+	std::chrono::steady_clock::time_point                   m_async_compute_logged {};
+	std::unique_ptr<Pipeline> CreateComputePipelineOnWorker(const ShaderComputeInputInfo& input_info,
+	                                                        vk::ShaderModule              module);
+	void PublishComputePipeline(uint64_t program_id, std::unique_ptr<Pipeline> pipeline);
+	void LogAsyncCompute(bool adopted);
+
+	// KYTY_ASYNC_GRAPHICS_PIPELINES=1 (default off; v0.30.0): the graphics pipelines of the store
+	// that the start-up prebuild left (past its time limit, or their programs not compiled yet)
+	// are built by one background thread once the store's programs are compiled, instead of by
+	// the execution thread at their first draw. The thread only publishes into
+	// m_async_graphics_pipelines; the execution thread adopts a pipeline when a draw asks for its
+	// key and brings the inputs it was built from, and makes it itself otherwise. Keys the
+	// execution thread created are listed so the thread does not build them again.
+	bool                                                    m_async_graphics = false;
+	std::vector<StoredPipeline>                             m_late_records;
+	std::mutex                                              m_async_graphics_mutex;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+	                                                        m_async_graphics_pipelines;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_inline_graphics_keys;
+	std::atomic_uint64_t                                    m_async_graphics_created {0};
+	std::atomic_uint64_t                                    m_async_graphics_failed {0};
+	std::atomic_uint64_t                                    m_async_graphics_late {0}; // built, but drawn first
+	uint64_t                                                m_async_graphics_adopted = 0; // execution thread
+	uint64_t                                                m_async_graphics_rebuilt = 0; // execution thread
+	uint64_t                                                m_async_graphics_inline  = 0; // execution thread
+	std::chrono::steady_clock::time_point                   m_async_graphics_logged {};
+	std::jthread                                            m_async_graphics_thread;
+	void      BuildLateGraphics(const std::stop_token& stop);
+	Pipeline* AdoptAsyncGraphics(GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
+	                             const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
+	void      LogAsyncGraphics(bool force);
+	// NHL27PIPEFIRST new_programs=: the programs that are in a graphics pipeline a draw has used
+	// (execution thread). A first-use pipeline whose programs were all known could have been
+	// built ahead of its draw.
+	std::unordered_set<uint64_t> m_graphics_pipeline_programs;
+	// KYTY_PIPELINE_WAIT_BUDGET_MS=n (default 0 = off; v0.30.0): counts the first-use graphics
+	// pipeline creates that took longer than n ms, which a time limit would have skipped. Nothing
+	// is skipped (NHL27PIPEBUDGET).
+	std::chrono::nanoseconds              m_pipeline_wait_budget {0};
+	uint64_t                              m_budget_over       = 0;
+	uint64_t                              m_budget_over_logged = 0;
+	double                                m_budget_max_ms     = 0.0;
+	std::chrono::steady_clock::time_point m_budget_logged {};
+	void NotePipelineWait(const GraphicsPipelineKey& key, std::chrono::nanoseconds took);
+	// What the creation of a graphics pipeline reads from the draw besides its key and programs.
+	static uint64_t GraphicsInputCheck(const PipelineVertexInputState& vertex_input,
+	                                   const PipelineStaticParameters& static_params,
+	                                   const ShaderVertexInputInfo& vertex, const ShaderPixelInputInfo* pixel);
+	// PipelineCacheTestAccess only: the state of the compile queue.
+	struct CompileStateForTests {
+		bool     urgent_first   = false;
+		bool     two_classes    = false;
+		size_t   queued         = 0;
+		size_t   in_flight      = 0;
+		size_t   stored_pending = 0;
+		size_t   workers        = 0;
+		uint64_t taken          = 0;
+	};
+	[[nodiscard]] CompileStateForTests CompileState();
+
 	// KYTY_PIPELINE_MEMO / NHL27PIPELINE: key and result of the previous GetGraphicsPipeline call. Pipelines are
 	// never erased before destruction, so the pointer stays valid.
 	GraphicsPipelineKey m_last_key {};
@@ -361,8 +435,9 @@ private:
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
 	void WriteDriverCache();
 	void CheckpointDriverCache();
+	// new_programs < 0: not printed.
 	void LogFirstUse(const char* kind, std::chrono::steady_clock::time_point begin, uint64_t first_id,
-	                 uint64_t second_id);
+	                 uint64_t second_id, int new_programs = -1);
 
 };
 

@@ -1,9 +1,11 @@
 #include "common/assert.h"
 
 #include "common/logging/log.h"
+#include "common/processExit.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -125,9 +127,25 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 	return 1;
 }
 
+static std::atomic<bool> g_terminate_on_exit {false};
+
+void SetTerminateOnExit() {
+	g_terminate_on_exit.store(true);
+}
+
+bool TerminateOnExit() {
+	return g_terminate_on_exit.load();
+}
+
 void DbgExit(int status) {
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_terminate_on_exit.load()) {
+		// _Exit ends in ExitProcess, which runs every DLL's DLL_PROCESS_DETACH (processExit.h).
+		TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+	}
+#endif
 	std::_Exit(status);
 }
 

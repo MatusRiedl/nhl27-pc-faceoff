@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/processExit.h"
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
 #include "common/singleton.h"
@@ -153,6 +154,11 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+	if (Common::TerminateOnExit()) {
+		// quick_exit ends in ExitProcess too: Streamline's DLL detach would crash (processExit.h). DbgExit runs the
+		// same emergency flush as the at_quick_exit handler, then TerminateProcess.
+		Common::DbgExit(0);
+	}
 	std::quick_exit(0);
 }
 

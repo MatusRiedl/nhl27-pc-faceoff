@@ -18,6 +18,7 @@
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/frameGen.h"
 #include "graphics/presentation/fsr/fsr1.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -294,6 +295,7 @@ public:
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
+	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 	bool SetHdr(bool hdr) {
 		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
 		m_hdr_requested = hdr;
@@ -343,6 +345,8 @@ struct Presenter::Impl {
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
+		// Frame generation off before any other recreate (DLSS-G guide: off before window changes).
+		FrameGen::BeforeOutsideRecreate();
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
@@ -490,6 +494,10 @@ void Swapchain::Create() {
 		return std::find(surface.present_modes.begin(), surface.present_modes.end(), mode) !=
 		       surface.present_modes.end();
 	};
+	// Frame generation does not run with FIFO on Vulkan: mailbox, else immediate, while it is on.
+	create_info.presentMode = static_cast<vk::PresentModeKHR>(FrameGen::AdjustPresentMode(
+	    static_cast<VkPresentModeKHR>(create_info.presentMode), available(vk::PresentModeKHR::eMailbox),
+	    available(vk::PresentModeKHR::eImmediate)));
 	if (create_info.presentMode == vk::PresentModeKHR::eMailbox && !available(create_info.presentMode) &&
 	    available(vk::PresentModeKHR::eImmediate)) {
 		// No Mailbox on AMD under Windows: there FIFO (and FIFO latest ready) blocked every present
@@ -1360,6 +1368,14 @@ void Presenter::Impl::Present() {
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	// Frame generation turning on or off (frameGen.h) recreates the swapchain in the matching
+	// present mode first; at most twice (the mode can turn back off while it waits).
+	if (const auto extent = swapchain.Extent(); FrameGen::BeforePresent(extent.width, extent.height).recreate) {
+		do {
+			swapchain.Recreate(false);
+			frames.SetFormat(swapchain.Format());
+		} while (FrameGen::AfterFrameGenRecreate());
+	}
 	static uint32_t capture_check  = 0;
 	bool            capture_wanted = false;
 	if (++capture_check % 30 == 0 && main_frame != nullptr && !main_frame->blank) {
@@ -1396,7 +1412,9 @@ void Presenter::Impl::Present() {
 			WritePresentCapture(window.graphic_ctx, capture);
 			capture_wanted = false;
 		}
+		FrameGen::PresentStart();
 		status = swapchain.Present();
+		FrameGen::PresentEnd();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

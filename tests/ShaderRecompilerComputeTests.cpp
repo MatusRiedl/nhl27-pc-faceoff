@@ -270,6 +270,48 @@ struct PipelineCacheTestAccess {
   static size_t ComputePipelines(const PipelineCache& cache) {
     return cache.m_compute_pipelines.size();
   }
+  // v0.30.0 (AsyncPipelineTests.inc).
+  using GraphicsKey = PipelineCache::GraphicsPipelineKey;
+  static PipelineCache::CompileStateForTests CompileState(PipelineCache& cache) { return cache.CompileState(); }
+  static bool AsyncGraphics(const PipelineCache& cache) { return cache.m_async_graphics; }
+  static void SetAsyncGraphics(PipelineCache& cache, bool on) { cache.m_async_graphics = on; }
+  static bool AsyncGraphicsThread(const PipelineCache& cache) { return cache.m_async_graphics_thread.joinable(); }
+  // empty(): StoredPipeline is only declared in pipelineCache.h.
+  static bool HasLateRecords(const PipelineCache& cache) { return !cache.m_late_records.empty(); }
+  static long long WaitBudgetMs(const PipelineCache& cache) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(cache.m_pipeline_wait_budget).count();
+  }
+  static bool AsyncComputeHas(PipelineCache& cache, uint64_t program_id) {
+    const std::lock_guard lock(cache.m_async_compute_mutex);
+    return cache.m_async_compute_pipelines.contains(program_id);
+  }
+  static uint64_t InputCheck(const GraphicsKey& key, const ShaderVertexInputInfo& vertex,
+                             const ShaderPixelInputInfo* pixel) {
+    return PipelineCache::GraphicsInputCheck(key.vertex_input, key.static_params, vertex, pixel);
+  }
+  // As the background thread publishes a pipeline it built.
+  static void Offer(PipelineCache& cache, const GraphicsKey& key, std::unique_ptr<PipelineCache::Pipeline> pipeline) {
+    const std::lock_guard lock(cache.m_async_graphics_mutex);
+    cache.m_async_graphics_pipelines.emplace(key, std::move(pipeline));
+  }
+  static PipelineCache::Pipeline* Adopt(PipelineCache& cache, GraphicsKey key,
+                                        std::span<const ShaderVertexInputInfo> vertex,
+                                        const ShaderPixelInputInfo* pixel,
+                                        const PipelineCache::GraphicsPrograms& programs) {
+    return cache.AdoptAsyncGraphics(key, vertex, pixel, programs);
+  }
+  struct AsyncGraphicsCounts {
+    uint64_t adopted = 0;
+    uint64_t rebuilt = 0;
+    size_t offered = 0;     // built, not adopted yet
+    size_t inline_keys = 0; // made by the draw
+    size_t pipelines = 0;   // in the cache
+  };
+  static AsyncGraphicsCounts AsyncGraphicsState(PipelineCache& cache) {
+    const std::lock_guard lock(cache.m_async_graphics_mutex);
+    return {cache.m_async_graphics_adopted, cache.m_async_graphics_rebuilt, cache.m_async_graphics_pipelines.size(),
+            cache.m_inline_graphics_keys.size(), cache.m_graphics_pipelines.size()};
+  }
 private:
   static void RequireEmpty(const PipelineCache& cache) { EXIT_IF(cache.m_driver_cache != nullptr); }
 };
@@ -46097,6 +46139,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
 }
 
 #include "PipelineWarmupTests.inc"
+#include "AsyncPipelineTests.inc"
 
 void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   constexpr const char *name = "ComputeLdsLimit";
@@ -53003,6 +53046,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--pipeline-warmup-only") == 0) {
     VulkanHarness vulkan;
     CheckPipelineWarmup(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--async-pipelines-only") == 0) {
+    VulkanHarness vulkan;
+    CheckAsyncPipelinesSwitchesOff(vulkan);
+    CheckCompileUrgentFirst(vulkan);
+    CheckAsyncGraphicsAdoption(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-state-only") == 0) {

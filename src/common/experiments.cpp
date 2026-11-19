@@ -1,6 +1,7 @@
 #include "common/experiments.h"
 
 #include "common/emulatorConfig.h"
+#include "common/threads.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -72,8 +73,12 @@ uint64_t EnvironmentMask() {
 	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->
 	// 59.4 fps (paired rounds 413 / 447). Measured on 16 logical CPUs (its default CPU is 14): with
 	// fewer it would take time from the game's threads, so it stays off there unless asked for.
-	const unsigned cpus = std::thread::hardware_concurrency();
-	set("KYTY_DRAW_RESOLVER", DrawResolver, cpus >= 16);
+	// Also needs 8 fast cores (2026-11-19): its CPU is fast core 7, an E-core or a missing core
+	// on smaller or hybrid CPUs (a 6P+8E laptop has 20 logical CPUs).
+	const unsigned cpus       = std::thread::hardware_concurrency();
+	const auto&    topology   = Common::Thread::GetCpuTopology();
+	const bool     fast_cores = !topology.valid || topology.fast_cores >= 8;
+	set("KYTY_DRAW_RESOLVER", DrawResolver, cpus >= 16 && fast_cores);
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, true);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, true);
@@ -104,8 +109,10 @@ uint64_t EnvironmentMask() {
 	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
 	// Two boots: execution-thread cost per draw -4..-7%, per dispatch -18..-20% (8 cores, 16 logical
-	// CPUs). With fewer than 12 logical CPUs the game would keep too few.
-	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, cpus >= 12);
+	// CPUs). With fewer than 12 logical CPUs the game would keep too few. Since 2026-11-19 it
+	// also needs 8 fast cores: on 6 cores / 12 threads it would keep the game off 2 of 6 cores
+	// (another PS5 emulator measured ~30 vs ~50 fps on 6-core Ryzens with a similar rule).
+	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, cpus >= 12 && fast_cores);
 	set("KYTY_GUEST_OFF_COPY_CORE", GuestOffCopyCore, false);
 	set("KYTY_GUEST_OFF_CP_CORES", GuestOffCpCores, false);
 	set("KYTY_SPECULATE_STRICT", SpeculateStrict, false);
@@ -128,8 +135,15 @@ void ApplyCpuSets(uint64_t mask) {
 		if (wanted == 0 || cpu < 0 || cpu >= 64) {
 			return;
 		}
-		// SMT siblings are adjacent logical CPUs.
-		excluded |= uint64_t {1} << static_cast<uint32_t>(cpu ^ 1);
+		// The whole physical core: its SMT siblings as Windows reports them (adjacent logical CPUs
+		// when the topology is unknown).
+		const auto& topology = Common::Thread::GetCpuTopology();
+		const auto  core     = topology.core_mask[cpu];
+		if (topology.valid && core != 0) {
+			excluded |= core;
+		} else {
+			excluded |= uint64_t {1} << static_cast<uint32_t>(cpu ^ 1);
+		}
 		if (wanted == 2) {
 			excluded |= uint64_t {1} << static_cast<uint32_t>(cpu);
 		}

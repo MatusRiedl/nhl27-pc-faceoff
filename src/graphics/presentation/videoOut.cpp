@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/fsr/frameGen.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
@@ -1123,6 +1124,8 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+	// GPU order: this flip shows the frame frame generation tagged since the last flip.
+	Graphics::FrameGen::FlipPrepared(request_id);
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
@@ -1385,6 +1388,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 			m_presenter.Discard(*hidden);
 		}
 		if (layer_count != 0) {
+			Graphics::FrameGen::PresentingFlip(group);
 			m_presenter.Present(std::span(layers.data(), layer_count));
 		}
 		if (requests[0].cfg->bus == 0) {
@@ -1801,6 +1805,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 		return result;
 	}
 	g_video_out_driver->SubmitFlipPreparation(request_id);
+	Graphics::FrameGen::FlipSubmitted(true);
 
 	return OK;
 }
@@ -1815,6 +1820,7 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 		return result;
 	}
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
+	Graphics::FrameGen::FlipSubmitted(false);
 
 	return OK;
 }
