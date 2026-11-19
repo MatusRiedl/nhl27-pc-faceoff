@@ -448,6 +448,29 @@ if(KYTY_ENABLE_DLSS)
 	endif()
 endif()
 
+# DLSS frame generation through NVIDIA Streamline (experimental, KYTY_DLSSG=1 at run time). Headers
+# only: sl.interposer.dll is loaded with LoadLibrary, so a missing DLL cannot stop the exe. The signed
+# production DLLs from bin/x64 are installed next to it (NvLowLatencyVk.dll is not redistributable).
+option(KYTY_ENABLE_DLSSG "Build DLSS frame generation through Streamline (needs KYTY_ENABLE_DLSS and STREAMLINE_SDK_DIR)" OFF)
+set(STREAMLINE_SDK_DIR "" CACHE PATH "Path to the extracted NVIDIA Streamline SDK (2.14.x)")
+if(KYTY_ENABLE_DLSSG)
+	if(NOT KYTY_ENABLE_DLSS)
+		message(FATAL_ERROR "KYTY_ENABLE_DLSSG needs KYTY_ENABLE_DLSS (the depth and motion tags come with the DLSS pass)")
+	endif()
+	if(NOT EXISTS "${STREAMLINE_SDK_DIR}/include/sl.h" OR NOT EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.dll")
+		message(FATAL_ERROR "KYTY_ENABLE_DLSSG needs STREAMLINE_SDK_DIR pointing at an extracted Streamline SDK")
+	endif()
+	include_directories(SYSTEM "${STREAMLINE_SDK_DIR}/include")
+	add_compile_definitions(KYTY_ENABLE_DLSSG=1)
+	# Keep in step with FrameGen::RequiredDlls (frameGenPolicy.h).
+	foreach(kyty_sl_dll sl.interposer.dll sl.common.dll sl.dlss_g.dll nvngx_dlssg.dll sl.reflex.dll sl.pcl.dll)
+		install(FILES "${STREAMLINE_SDK_DIR}/bin/x64/${kyty_sl_dll}" DESTINATION .)
+	endforeach()
+	install(FILES "${STREAMLINE_SDK_DIR}/license.txt" DESTINATION licenses/Streamline)
+	install(FILES "${STREAMLINE_SDK_DIR}/bin/x64/nvngx_dlss.license.txt" DESTINATION licenses/Streamline
+	        RENAME nvngx_dlssg.license.txt)
+endif()
+
 # NHL 27 XeSS bridge (opt-in): the SDK headers are used for types only; libxess.dll is
 # loaded at runtime (like the FSR 4 bridge loads AMD's loader DLL), so nothing is linked.
 option(KYTY_ENABLE_XESS "Build the NHL 27 XeSS D3D12 bridge (needs XESS_SDK_DIR)" OFF)
@@ -633,6 +656,21 @@ target_link_libraries(experiments_tests PRIVATE fmt::fmt common)
 if(LINUX OR APPLE)
 	target_link_libraries(experiments_tests PRIVATE Threads::Threads)
 endif()
+
+# v0.30.0 compile worker queue (header-only, no GPU).
+add_executable(compile_queue_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CompileQueueTests.cpp"
+)
+target_include_directories(compile_queue_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX OR APPLE)
+	target_link_libraries(compile_queue_tests PRIVATE Threads::Threads)
+endif()
+
+# v0.30.0 DLSS frame generation decisions and camera maths (header-only, no GPU, no Streamline).
+add_executable(frame_gen_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FrameGenTests.cpp"
+)
+target_include_directories(frame_gen_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
 add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
@@ -849,6 +887,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME experiments COMMAND $<TARGET_FILE:experiments_tests>)
+	add_test(NAME compile_queue COMMAND $<TARGET_FILE:compile_queue_tests>)
+	add_test(NAME frame_gen COMMAND $<TARGET_FILE:frame_gen_tests>)
 	add_test(NAME compute_resolve_ahead
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-resolve-ahead-only)
 	# The perf branch initializes diagnostic gates before main(), so the counter-based
@@ -891,6 +931,7 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_async_pipelines COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipelines-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
@@ -958,6 +999,8 @@ if(BUILD_TESTING)
 
 	add_custom_target(kyty_tests DEPENDS
 		experiments_tests
+		compile_queue_tests
+		frame_gen_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

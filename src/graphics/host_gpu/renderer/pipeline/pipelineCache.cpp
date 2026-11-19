@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/compileQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStore.h"
@@ -1095,11 +1096,10 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
-		// Compute programs are compiled by the execution thread itself.
-		if constexpr (!compute) {
-			if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
-				QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
-			}
+		// Compute programs are compiled by the execution thread itself, unless
+		// KYTY_ASYNC_COMPUTE_PIPELINES=1 queues them (QueueAllowed).
+		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages && QueueAllowed(input_info)) {
+			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
 		}
 		// Experiment DrawResolver: the other draw resolver materializes this program; wait for it
 		// without the lock (a busy entry would leave the draw to the execution thread).
@@ -1187,7 +1187,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (permutation == source.permutations.end()) {
-			if constexpr (!compute) {
+			if (QueueAllowed(input_info)) {
 				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
 			}
 			ahead.reads.Fail();
@@ -1906,16 +1906,44 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t>                                       back_code;
 		bool                                                        stored = false;
 	};
-	static constexpr uint32_t CompileWorkers = 6;
+	// Common::Thread::CompileWorkerCount gives the number of workers (6 up to 8 cores).
+
+	// KYTY_ASYNC_COMPUTE_PIPELINES=1 (default off; 2026-11-19): the resolve thread also queues the
+	// compute programs and permutations its direct dispatches miss, and the worker that compiles
+	// one creates its pipeline too (owner->CreateComputePipelineOnWorker), so a new area's compute
+	// pipelines build in parallel instead of one after another on the execution thread, which
+	// waits for them in WaitForCompile. Indirect dispatches (group counts unknown ahead) stay on
+	// the execution thread. Off: exactly the earlier path.
+	PipelineCache* owner         = nullptr;
+	bool           async_compute = false;
+
+	template <typename InputInfo>
+	[[nodiscard]] bool QueueAllowed(const InputInfo& input_info) const {
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			return async_compute && std::ranges::find(input_info.workgroup_counts, 0u) == std::end(input_info.workgroup_counts);
+		} else {
+			(void)input_info;
+			return true;
+		}
+	}
 
 	std::atomic_flag* program_lock = nullptr;
 	// Under the program lock: programs a worker is compiling, with their number of jobs.
 	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> in_flight;
-	std::mutex                                     job_mutex;
-	std::condition_variable                        job_available;
-	std::deque<std::unique_ptr<CompileJob>>        jobs;
-	bool                                           stopping = false;
+	// KYTY_COMPILE_URGENT_FIRST=1 (default off; 2026-11-19): the workers take the jobs of draws the
+	// resolve thread has just seen before the start-up backlog of the store, and the execution
+	// thread no longer waits behind queued jobs (WaitForCompile). Off: one first-in-first-out
+	// queue, as before.
+	CompileQueue<ProgramKey, CompileJob, ProgramKeyHash> queue;
+	bool                                           urgent_first = false;
+	// Jobs of the store (LoadStore) not finished yet: the late graphics pipelines wait for them
+	// (KYTY_ASYNC_GRAPHICS_PIPELINES), with either queue mode.
+	std::atomic<size_t>                            stored_pending {0};
 	std::vector<std::jthread>                      workers;
+	// Execution thread (NHL27COMPILEQ).
+	uint64_t                                       waited_running = 0;
+	uint64_t                                       queue_events   = 0;
+	std::chrono::steady_clock::time_point          queue_logged {};
 
 	void LockPrograms() {
 		if (!program_lock->test_and_set(std::memory_order_acquire)) {
@@ -1940,6 +1968,11 @@ struct PipelineCache::ProgramCache {
 	                  uint32_t                                            push_data_cursor,
 	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization) {
 		if (in_flight.contains(lookup_key)) {
+			// A draw needs a program of the store that still waits in the backlog: compile it
+			// before the rest of the backlog (nothing happens with one queue class).
+			if (urgent_first) {
+				queue.Promote(lookup_key, CompileLevel::Live);
+			}
 			return;
 		}
 		auto job              = std::make_unique<CompileJob>();
@@ -1952,24 +1985,59 @@ struct PipelineCache::ProgramCache {
 		}
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			job->vertex = std::make_unique<ShaderVertexInputInfo>(input_info);
+		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			job->compute = std::make_unique<ShaderComputeInputInfo>(input_info);
+			job->compute->stage = {};
 		} else {
 			job->pixel = std::make_unique<ShaderPixelInputInfo>(input_info);
 		}
 		in_flight[lookup_key]++;
-		{
-			std::lock_guard lock(job_mutex);
-			jobs.push_back(std::move(job));
+		queue.Push(lookup_key, std::move(job), CompileClass::Live);
+	}
+
+	// Execution thread (NHL27COMPILEQ): the first 20 events, then at most every 2 s.
+	void LogCompileQueue() {
+		const auto now = std::chrono::steady_clock::now();
+		if (++queue_events > 20 && now - queue_logged < std::chrono::seconds(2)) {
+			return;
 		}
-		job_available.notify_one();
+		queue_logged     = now;
+		const auto stats = queue.Stats();
+		std::printf("NHL27COMPILEQ: taken=%llu promoted=%llu waited_running=%llu live_max=%zu live_left=%zu "
+		            "stored_left=%zu\n",
+		            static_cast<unsigned long long>(stats.taken), static_cast<unsigned long long>(stats.promoted),
+		            static_cast<unsigned long long>(waited_running), stats.live_max, stats.live_left,
+		            stats.stored_left);
 	}
 
 	// Execution thread, under the program lock: waits without the lock until no worker compiles
-	// the program of lookup_key. False when none did.
+	// the program of lookup_key. False when none did (the caller then compiles it).
 	bool WaitForCompile() {
 		if (!in_flight.contains(lookup_key)) {
 			return false;
 		}
 		const auto key = lookup_key;
+		if (urgent_first) {
+			// The job still waits for a free worker: this thread compiles the program itself
+			// (the caller's own path, with the state of the draw it has in hand) instead of
+			// waiting behind the jobs in front of it. A live job is the only job of its key
+			// (QueueCompile queues none for a key in flight), so the key leaves in_flight. The
+			// job is not run here: it reads guest memory as the resolve thread does (ahead) and
+			// may then wait for this thread.
+			if (const auto job = queue.Take(key); job != nullptr) {
+				if (const auto job_count = in_flight.find(key); --job_count->second == 0) {
+					in_flight.erase(job_count);
+				}
+				LogCompileQueue();
+				return false;
+			}
+			// Jobs of the store are never dropped (several share a program, and compiling one
+			// here would store its record again): they go in front of every other job.
+			if (queue.Promote(key, CompileLevel::Urgent) == 0) {
+				waited_running++;
+			}
+			LogCompileQueue();
+		}
 		const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::CompileWait);
 		do {
 			UnlockPrograms();
@@ -1997,6 +2065,13 @@ struct PipelineCache::ProgramCache {
 			if (!source.calls.empty()) {
 				throw Common::SoftExitError("SWAPPC program");
 			}
+			// The execution thread marks such a compute program to skip its dispatches; a
+			// permutation added here would run them instead (KYTY_ASYNC_COMPUTE_PIPELINES).
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				if (source.unsupported_call_pc != UINT32_MAX) {
+					throw Common::SoftExitError("unsupported GPU-selected callable target");
+				}
+			}
 			auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
 			if (translated.build_failed) {
 				throw Common::SoftExitError("shader CFG build failed");
@@ -2007,7 +2082,7 @@ struct PipelineCache::ProgramCache {
 				GuestReadLog                           reads;
 				ShaderRecompiler::IR::ResourceSnapshot resources;
 				specialization.emplace();
-				const ShaderRecompiler::IR::SrtRuntime runtime {
+				ShaderRecompiler::IR::SrtRuntime runtime {
 				    .user_data =
 				        std::span(job.params.user_data).first(job.params.user_data_count),
 				    .shader_base                = job.params.Base(),
@@ -2015,6 +2090,11 @@ struct PipelineCache::ProgramCache {
 				    .userdata                   = &reads,
 				    .read_specialization_memory = ReadAheadStrict,
 				};
+				// As the execution thread materializes compute programs (only direct dispatches
+				// are queued, so the counts are known).
+				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+					runtime.workgroup_counts = input_info.workgroup_counts;
+				}
 				if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
 				                                                *specialization)) {
 					specialization.reset();
@@ -2028,6 +2108,19 @@ struct PipelineCache::ProgramCache {
 		} catch (const Common::SoftExitError&) {
 			// The execution thread compiles the program itself and reports the error.
 			permutation.reset();
+		}
+		// KYTY_ASYNC_COMPUTE_PIPELINES: the pipeline of a new compute permutation, created before
+		// the program is published, so the execution thread's WaitForCompile covers both. Programs
+		// of the store (job.stored) are left to PrebuildPipelines. A failed create leaves the
+		// pipeline to the execution thread, which reports the error.
+		std::unique_ptr<PipelineCache::Pipeline> compute_pipeline;
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (permutation && async_compute && !job.stored && owner != nullptr) {
+				static const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
+				ShaderComputeInputInfo pipeline_info = input_info;
+				pipeline_info.stage = {.program = &permutation->program, .resources = &no_resources};
+				compute_pipeline    = owner->CreateComputePipelineOnWorker(pipeline_info, permutation->handle.module);
+			}
 		}
 		const uint64_t uid = permutation ? PermutationUid(job.key, *permutation) : 0;
 		LockPrograms();
@@ -2050,29 +2143,36 @@ struct PipelineCache::ProgramCache {
 				}
 				permutations.push_back(std::move(*permutation));
 				uids[permutations.back().handle.id] = uid;
+				// Published before in_flight lets the execution thread look for it.
+				if (compute_pipeline != nullptr) {
+					owner->PublishComputePipeline(permutations.back().handle.id, std::move(compute_pipeline));
+				}
 			}
 		}
 		if (const auto job_count = in_flight.find(job.key); --job_count->second == 0) {
 			in_flight.erase(job_count);
 		}
 		UnlockPrograms();
+		if (compute_pipeline != nullptr) {
+			// The permutation was known already (its module is destroyed above).
+			owner->DestroyPipeline(*compute_pipeline);
+		}
 		if (stored_specialization) {
 			Store(job.key, job.params, input_info, job.push_data_cursor, *stored_specialization);
+		}
+		if (job.stored) {
+			stored_pending.fetch_sub(1, std::memory_order_release);
 		}
 	}
 
 	void CompileWorker(const std::stop_token& stop) {
 		KYTY_PROFILER_THREAD("Thread_ShaderCompile");
 		for (;;) {
-			std::unique_ptr<CompileJob> job;
-			{
-				std::unique_lock lock(job_mutex);
-				job_available.wait(lock, [&] { return stopping || !jobs.empty(); });
-				if (stopping) {
-					return;
-				}
-				job = std::move(jobs.front());
-				jobs.pop_front();
+			// Stop() wakes every worker; the stop token is not used.
+			(void)stop;
+			const auto job = queue.Pop();
+			if (job == nullptr) {
+				return;
 			}
 			if (job->vertex != nullptr) {
 				RunCompileJob(*job, *job->vertex);
@@ -2088,11 +2188,7 @@ struct PipelineCache::ProgramCache {
 	bool WaitIdle(std::chrono::milliseconds limit) {
 		const auto end = std::chrono::steady_clock::now() + limit;
 		for (;;) {
-			bool idle = false;
-			{
-				std::lock_guard lock(job_mutex);
-				idle = jobs.empty();
-			}
+			bool idle = queue.Empty();
 			if (idle) {
 				LockPrograms();
 				idle = in_flight.empty();
@@ -2212,30 +2308,34 @@ struct PipelineCache::ProgramCache {
 			LockPrograms();
 			in_flight[job->key]++;
 			UnlockPrograms();
-			{
-				std::lock_guard lock(job_mutex);
-				jobs.push_back(std::move(job));
-			}
+			// Bound before the call: the argument order is unspecified, and the job object
+			// outlives the move of its pointer.
+			const auto& key = job->key;
+			stored_pending.fetch_add(1, std::memory_order_relaxed);
+			queue.Push(key, std::move(job), CompileClass::Stored);
 			queued++;
 		}
-		job_available.notify_all();
 		PipelineCacheLog("Shader program store: {} programs from {} queued for compilation", queued,
 		                 Common::PathToString(path));
 	}
 
 	void StartWorkers(std::atomic_flag* lock) {
 		program_lock = lock;
-		for (uint32_t i = 0; i < CompileWorkers; i++) {
+		// KYTY_COMPILE_WORKERS=n (1..16) sets the number, "0" the old fixed 6; unset is the rule.
+		const auto&    topology = Common::Thread::GetCpuTopology();
+		const char*    rule     = "";
+		const uint32_t count =
+		    Common::Thread::CompileWorkerCount(topology, std::getenv("KYTY_COMPILE_WORKERS"), &rule);
+		std::printf("NHL27COMPILEQ: workers=%u rule=%s cores=%u urgent_first=%d\n", count, rule,
+		            topology.valid ? topology.cores : 0u, urgent_first ? 1 : 0);
+		std::fflush(stdout);
+		for (uint32_t i = 0; i < count; i++) {
 			workers.emplace_back([this](const std::stop_token& stop) { CompileWorker(stop); });
 		}
 	}
 
 	void StopWorkers() {
-		{
-			std::lock_guard lock(job_mutex);
-			stopping = true;
-		}
-		job_available.notify_all();
+		queue.Stop();
 		workers.clear();
 	}
 	GraphicContext&                                             graphics;
@@ -2251,6 +2351,13 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// LoadStore takes the program lock, so it must be set before the store is read.
 	m_program_cache->program_lock = &m_program_lock;
+	// KYTY_COMPILE_URGENT_FIRST=1 (default off; ProgramCache::urgent_first), before LoadStore
+	// queues the store's programs.
+	if (const char* urgent = std::getenv("KYTY_COMPILE_URGENT_FIRST");
+	    urgent != nullptr && urgent[0] == '1' && urgent[1] == '\0') {
+		m_program_cache->urgent_first = true;
+		m_program_cache->queue.SetTwoClasses(true);
+	}
 	InitializeDriverCache();
 	InitializeShaderRecord();
 	std::vector<StoredPipeline> stored_pipelines;
@@ -2302,11 +2409,57 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		stored_pipelines =
 		    OpenPipelineStore(directory / fmt::format("{}.{}.pipelines", title_id, build));
 	}
+	// KYTY_ASYNC_COMPUTE_PIPELINES=1 (default off; ProgramCache::async_compute).
+	m_program_cache->owner = this;
+	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE_PIPELINES");
+	    async != nullptr && async[0] == '1' && async[1] == '\0') {
+		m_program_cache->async_compute = true;
+		std::printf("NHL27ASYNCCS: compile workers create the compute pipelines of programs queued ahead\n");
+		std::fflush(stdout);
+	}
 	m_program_cache->StartWorkers(&m_program_lock);
+	// KYTY_ASYNC_GRAPHICS_PIPELINES=1 (default off): PrebuildPipelines keeps the records it left
+	// for the background thread. Its pipelines are adopted as the prebuilt ones are (neither is
+	// recorded again in the shader record).
+	if (const char* async = std::getenv("KYTY_ASYNC_GRAPHICS_PIPELINES");
+	    async != nullptr && async[0] == '1' && async[1] == '\0') {
+		m_async_graphics = true;
+	}
+	// KYTY_PIPELINE_WAIT_BUDGET_MS=n (default 0 = off): count-only (NHL27PIPEBUDGET).
+	if (const char* budget = std::getenv("KYTY_PIPELINE_WAIT_BUDGET_MS"); budget != nullptr && budget[0] != '\0') {
+		m_pipeline_wait_budget = std::chrono::milliseconds(std::clamp(std::strtol(budget, nullptr, 10), 0L, 1000L));
+		if (m_pipeline_wait_budget.count() != 0) {
+			std::printf("NHL27PIPEBUDGET: counting first-use graphics pipelines slower than %lld ms (nothing is skipped)\n",
+			            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(m_pipeline_wait_budget).count()));
+			std::fflush(stdout);
+		}
+	}
 	PrebuildPipelines(stored_pipelines);
+	if (m_async_graphics) {
+		if (!m_late_records.empty()) {
+			std::printf("NHL27ASYNCGFX: on; a background thread builds the %zu stored graphics pipelines the "
+			            "start-up left\n",
+			            m_late_records.size());
+			m_async_graphics_thread = std::jthread([this](const std::stop_token& stop) { BuildLateGraphics(stop); });
+		} else {
+			// Nothing for the thread: no draw adopts anything, every pipeline is created as before.
+			std::printf("NHL27ASYNCGFX: on, idle: %s\n",
+			            m_pipeline_store == nullptr ? "no pipeline store (pre-gen off or no title id)"
+			                                        : "the start-up built every stored graphics pipeline");
+		}
+		std::fflush(stdout);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	// Before the workers, the driver cache and the pipelines it uses go.
+	if (m_async_graphics_thread.joinable()) {
+		m_async_graphics_thread.request_stop();
+		m_async_graphics_thread.join();
+	}
+	if (m_async_graphics) {
+		LogAsyncGraphics(true);
+	}
 	m_program_cache->StopWorkers();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -2319,6 +2472,10 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// Created for permutations no dispatch has used yet (KYTY_ASYNC_COMPUTE_PIPELINES).
+	destroy(m_async_compute_pipelines);
+	// Built for keys no draw has asked for yet (KYTY_ASYNC_GRAPHICS_PIPELINES).
+	destroy(m_async_graphics_pipelines);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -2425,6 +2582,8 @@ void PipelineCache::Save() {
 		return;
 	}
 	WriteDriverCache();
+	// A compile worker may be creating a pipeline with it (KYTY_ASYNC_COMPUTE_PIPELINES).
+	const std::unique_lock guard(m_driver_cache_guard);
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }
@@ -2432,15 +2591,23 @@ void PipelineCache::Save() {
 // NHL27PIPEFIRST: a pipeline built on the execution thread at first use (the store did not have it),
 // with how long the driver took. Printed for the first 200 per session; costs nothing per draw.
 void PipelineCache::LogFirstUse(const char* kind, std::chrono::steady_clock::time_point begin,
-                                uint64_t first_id, uint64_t second_id) {
+                                uint64_t first_id, uint64_t second_id, int new_programs) {
 	static std::atomic<uint32_t> printed {0};
 	if (printed.fetch_add(1, std::memory_order_relaxed) >= 200) {
 		return;
 	}
 	const auto now = std::chrono::steady_clock::now();
 	const auto ms  = std::chrono::duration<double, std::milli>(now - begin).count();
-	std::printf("NHL27PIPEFIRST kind=%s ms=%.1f ids=%llu,%llu\n", kind, ms,
-	            static_cast<unsigned long long>(first_id), static_cast<unsigned long long>(second_id));
+	if (new_programs >= 0) {
+		// new_programs: how many of the draw's programs were in no pipeline a draw used before
+		// (0 = the pipeline could have been built ahead of the draw).
+		std::printf("NHL27PIPEFIRST kind=%s ms=%.1f ids=%llu,%llu new_programs=%d\n", kind, ms,
+		            static_cast<unsigned long long>(first_id), static_cast<unsigned long long>(second_id),
+		            new_programs);
+	} else {
+		std::printf("NHL27PIPEFIRST kind=%s ms=%.1f ids=%llu,%llu\n", kind, ms,
+		            static_cast<unsigned long long>(first_id), static_cast<unsigned long long>(second_id));
+	}
 	std::fflush(stdout);
 }
 
@@ -2671,10 +2838,10 @@ static std::chrono::milliseconds PipelinePrebuildBudget() {
 // the stage the vertex program runs as, the vertex formats and, for a rectangle list, how the pixel
 // parameters are mapped (CreatePipelineInternal, BuildRectListShaders). The key has always left
 // these out, so the first draw's values make the pipeline of a key.
-static uint64_t GraphicsInputCheck(const PipelineVertexInputState& vertex_input,
-                                   const PipelineStaticParameters& static_params,
-                                   const ShaderVertexInputInfo&    vertex,
-                                   const ShaderPixelInputInfo*     pixel) {
+uint64_t PipelineCache::GraphicsInputCheck(const PipelineVertexInputState& vertex_input,
+                                          const PipelineStaticParameters& static_params,
+                                          const ShaderVertexInputInfo&    vertex,
+                                          const ShaderPixelInputInfo*     pixel) {
 	std::array<uint32_t, 1 + ShaderVertexInputInfo::RES_MAX * 2 + 3 + 32> words {};
 	size_t                                                               count = 0;
 	words[count++] = static_cast<uint32_t>(vertex.logical_stage);
@@ -2729,6 +2896,14 @@ void PipelineCache::PrebuildPipelines(std::vector<StoredPipeline>& records) {
 		return;
 	}
 	const auto budget = PipelinePrebuildBudget();
+	if (m_async_graphics && budget.count() == 0) {
+		// KYTY_PIPELINE_PREBUILD_MS=0: every stored graphics pipeline is left to the background thread.
+		for (auto& record: records) {
+			if (!record.compute) {
+				m_late_records.push_back(std::move(record));
+			}
+		}
+	}
 	if (records.empty() || budget.count() == 0) {
 		PipelineCacheLog("Pipeline store: {} pipelines stored, none built at start-up{}",
 		                 records.size(), budget.count() == 0 ? " (KYTY_PIPELINE_PREBUILD_MS=0)" : "");
@@ -2776,15 +2951,23 @@ void PipelineCache::PrebuildPipelines(std::vector<StoredPipeline>& records) {
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	size_t      built = 0, present = 0, unresolved = 0, failed = 0, late = 0;
 	m_pipeline_store->BeginPrebuild();
-	for (const auto& record: records) {
+	for (auto& record: records) {
 		if (std::chrono::steady_clock::now() - start > budget) {
 			late++;
+			// KYTY_ASYNC_GRAPHICS_PIPELINES: left to the background thread.
+			if (m_async_graphics && !record.compute) {
+				m_late_records.push_back(std::move(record));
+			}
 			continue;
 		}
 		const auto program = resolved.find(record.program_uid);
 		const auto pixel   = record.pixel ? resolved.find(record.pixel_uid) : resolved.end();
 		if (program == resolved.end() || (record.pixel && pixel == resolved.end())) {
 			unresolved++;
+			// Its programs may still be compiling: the background thread tries again.
+			if (m_async_graphics && !record.compute) {
+				m_late_records.push_back(std::move(record));
+			}
 			continue;
 		}
 		// The pipeline is built from the handles the names resolve to and stored under a key
@@ -3448,12 +3631,28 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 			if (iter->second->prebuilt) [[unlikely]] {
 				UsePrebuiltGraphics(*iter->second, key, vertex_info, ps_input_info, programs);
+				m_graphics_pipeline_programs.insert(vs_id);
+				if (ps_id != 0) {
+					m_graphics_pipeline_programs.insert(ps_id);
+				}
 			}
 			if (memo_on || FrameBreakdown::Verbose()) {
 				m_last_key      = key;
 				m_last_pipeline = iter->second.get();
 			}
 			return *iter->second;
+		}
+	}
+
+	// KYTY_ASYNC_GRAPHICS_PIPELINES: a pipeline the background thread built for this key. Not
+	// with a debug dump (it dumps the inputs of the create below).
+	if (m_async_graphics && !graphics_debug_dump_enabled()) [[unlikely]] {
+		if (auto* adopted = AdoptAsyncGraphics(key, vertex_info, ps_input_info, programs); adopted != nullptr) {
+			m_graphics_pipeline_programs.insert(vs_id);
+			if (ps_id != 0) {
+				m_graphics_pipeline_programs.insert(ps_id);
+			}
+			return *adopted;
 		}
 	}
 
@@ -3477,7 +3676,18 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache);
 	}
-	LogFirstUse("graphics", first_use_begin, vs_id, ps_id);
+	{
+		const int new_programs = (m_graphics_pipeline_programs.insert(vs_id).second ? 1 : 0) +
+		                         (ps_id != 0 && m_graphics_pipeline_programs.insert(ps_id).second ? 1 : 0);
+		LogFirstUse("graphics", first_use_begin, vs_id, ps_id, new_programs);
+	}
+	if (m_pipeline_wait_budget.count() != 0) [[unlikely]] {
+		NotePipelineWait(key, std::chrono::steady_clock::now() - first_use_begin);
+	}
+	if (m_async_graphics) [[unlikely]] {
+		m_async_graphics_inline++;
+		LogAsyncGraphics(false);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
@@ -3515,16 +3725,29 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto       cached          = std::make_unique<Pipeline>();
+	// KYTY_ASYNC_COMPUTE_PIPELINES: a compile worker may have created it with the program.
+	std::unique_ptr<Pipeline> cached;
+	if (m_program_cache->async_compute) {
+		const std::lock_guard lock(m_async_compute_mutex);
+		if (auto found = m_async_compute_pipelines.find(compute_program.id); found != m_async_compute_pipelines.end()) {
+			cached = std::move(found->second);
+			m_async_compute_pipelines.erase(found);
+		}
+	}
+	const bool adopted         = cached != nullptr;
 	const auto first_use_begin = std::chrono::steady_clock::now();
-	{
+	if (!adopted) {
+		cached = std::make_unique<Pipeline>();
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
 		                       m_driver_cache);
 	}
-	LogFirstUse("compute", first_use_begin, compute_program.id, 0);
+	LogFirstUse(adopted ? "compute-worker" : "compute", first_use_begin, compute_program.id, 0);
+	if (m_program_cache->async_compute) {
+		LogAsyncCompute(adopted);
+	}
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 
@@ -3541,5 +3764,335 @@ if (m_record != nullptr && m_record->IsOpen() && m_program_cache->replaying == n
 	CheckpointDriverCache();
 
 	return *iter->second;
+}
+
+// KYTY_ASYNC_GRAPHICS_PIPELINES: the background thread. Waits until the compile workers have
+// compiled the store's programs, resolves the records' program names as PrebuildPipelines does,
+// and builds each record's pipeline unless the execution thread made the key already. It yields
+// while the workers have jobs of draws on screen. Rectangle lists (their create builds extra
+// shaders) and multi-stage records stay with the execution thread.
+void PipelineCache::BuildLateGraphics(const std::stop_token& stop) {
+	KYTY_PROFILER_THREAD("Thread_LateGraphicsPipelines");
+	const auto start   = std::chrono::steady_clock::now();
+	const auto seconds = [start] {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+	};
+	while (!stop.stop_requested() && m_program_cache->stored_pending.load(std::memory_order_acquire) != 0 &&
+	       std::chrono::steady_clock::now() - start < std::chrono::minutes(3)) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+	if (stop.stop_requested()) {
+		return;
+	}
+	const double waited = seconds();
+	// As PrebuildPipelines (kept apart so the start-up path stays as it was).
+	struct Resolved {
+		ShaderProgram      handle;
+		ShaderStageRuntime stage;
+	};
+	static const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
+	std::unordered_map<uint64_t, Resolved> resolved;
+	std::unordered_set<uint64_t>           ambiguous;
+	{
+		const ProgramLockGuard lock(m_program_lock);
+		for (const auto& [key, entry]: m_program_cache->programs) {
+			for (const auto& permutation: entry.permutations) {
+				const auto uid = m_program_cache->uids.find(permutation.handle.id);
+				if (uid == m_program_cache->uids.end()) {
+					continue;
+				}
+				// The create reads only the program (never the resources, which the execution
+				// thread changes per draw). Entries and permutations are never moved or removed.
+				const bool inserted =
+				    resolved
+				        .try_emplace(uid->second,
+				                     Resolved {permutation.handle, {.program = &permutation.program, .resources = &no_resources}})
+				        .second;
+				if (!inserted) {
+					ambiguous.insert(uid->second);
+				}
+			}
+		}
+	}
+	for (const auto uid: ambiguous) {
+		resolved.erase(uid);
+	}
+	size_t built = 0, present = 0, unresolved = 0, skipped = 0, failed = 0, late = 0;
+	for (auto& record: m_late_records) {
+		if (stop.stop_requested()) {
+			break;
+		}
+		if (record.compute || record.static_params.topology == vk::PrimitiveTopology::ePatchList) {
+			skipped++;
+			continue;
+		}
+		const auto program = resolved.find(record.program_uid);
+		const auto pixel   = record.pixel ? resolved.find(record.pixel_uid) : resolved.end();
+		if (program == resolved.end() || (record.pixel && pixel == resolved.end())) {
+			unresolved++;
+			continue;
+		}
+		auto vertex = std::make_unique<ShaderVertexInputInfo>();
+		std::memcpy(vertex.get(), record.input_info.data(), sizeof(ShaderVertexInputInfo));
+		std::unique_ptr<ShaderPixelInputInfo> pixel_info;
+		if (record.pixel) {
+			pixel_info = std::make_unique<ShaderPixelInputInfo>();
+			std::memcpy(pixel_info.get(), record.pixel_info.data(), sizeof(ShaderPixelInputInfo));
+		}
+		const auto vertex_stage = program->second.stage.program->stage;
+		const bool usable =
+		    record.input_info.size() == sizeof(ShaderVertexInputInfo) &&
+		    (!record.pixel || record.pixel_info.size() == sizeof(ShaderPixelInputInfo)) &&
+		    vertex->logical_stage == ShaderType::Vertex && vertex->resources_num >= 0 &&
+		    vertex->resources_num <= ShaderVertexInputInfo::RES_MAX && vertex->buffers_num >= 0 &&
+		    vertex->buffers_num <= ShaderVertexInputInfo::RES_MAX && vertex_stage != ShaderType::Pixel &&
+		    vertex_stage != ShaderType::Compute && vertex_stage != ShaderType::Mesh &&
+		    (!record.pixel || (pixel_info->input_num <= std::size(pixel_info->interpolator_settings) &&
+		                       pixel->second.stage.program->stage == ShaderType::Pixel));
+		if (!usable) {
+			skipped++;
+			continue;
+		}
+		GraphicsPipelineKey key;
+		key.rendering            = record.rendering;
+		key.vertex_shader_ids[0] = program->second.handle.id;
+		key.ps_shader_id         = record.pixel ? pixel->second.handle.id : 0;
+		key.vertex_input         = record.vertex_input;
+		key.static_params        = record.static_params;
+		{
+			const std::lock_guard lock(m_async_graphics_mutex);
+			if (m_inline_graphics_keys.contains(key) || m_async_graphics_pipelines.contains(key)) {
+				present++;
+				continue;
+			}
+		}
+		// Draws on screen first: the workers' live jobs, then this thread.
+		while (!stop.stop_requested() && m_program_cache->queue.Stats().live_left != 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		vertex->stage = program->second.stage;
+		GraphicsPrograms programs;
+		programs.vertex[0] = program->second.handle;
+		if (record.pixel) {
+			pixel_info->stage = pixel->second.stage;
+			programs.pixel    = pixel->second.handle;
+		}
+		auto pipeline = std::make_unique<Pipeline>();
+		bool ok       = false;
+		try {
+			const Common::SoftExitScope soft_exit(true);
+			const std::shared_lock      guard(m_driver_cache_guard);
+			CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
+			                       std::span<const ShaderVertexInputInfo>(vertex.get(), 1), pixel_info.get(), programs,
+			                       key.static_params, m_driver_cache);
+			ok = pipeline->pipeline != nullptr && pipeline->pipeline_layout != nullptr;
+		} catch (const Common::SoftExitError& error) {
+			std::printf("NHL27ASYNCGFX: background create failed (%s); the draw creates it\n", error.what());
+			std::fflush(stdout);
+		}
+		if (!ok) {
+			DestroyPipeline(*pipeline);
+			failed++;
+			m_async_graphics_failed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		pipeline->prebuilt    = true;
+		pipeline->input_check = GraphicsInputCheck(key.vertex_input, key.static_params, *vertex, pixel_info.get());
+		m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+		m_async_graphics_created.fetch_add(1, std::memory_order_relaxed);
+		{
+			const std::lock_guard lock(m_async_graphics_mutex);
+			if (!m_inline_graphics_keys.contains(key)) {
+				m_async_graphics_pipelines.try_emplace(std::move(key), std::move(pipeline));
+			}
+		}
+		if (pipeline != nullptr) {
+			// A draw made the key while this thread built it.
+			DestroyPipeline(*pipeline);
+			late++;
+			m_async_graphics_late.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			built++;
+		}
+	}
+	std::printf("NHL27ASYNCGFX: background thread done in %.1fs (%.1fs waiting for the programs): built=%zu "
+	            "present=%zu unresolved=%zu skipped=%zu failed=%zu drawn_first=%zu of %zu%s\n",
+	            seconds(), waited, built, present, unresolved, skipped, failed, late, m_late_records.size(),
+	            stop.stop_requested() ? " (stopped)" : "");
+	std::fflush(stdout);
+	m_late_records.clear();
+	m_late_records.shrink_to_fit();
+}
+
+// Execution thread (KYTY_ASYNC_GRAPHICS_PIPELINES): the pipeline the background thread built for
+// the key, now in m_graphics_pipelines, or null (the caller creates it, and the key is listed so
+// the thread does not build it). As UsePrebuiltGraphics: the pipeline is used when the draw brings
+// the inputs it was built from, otherwise this draw makes the key's pipeline.
+PipelineCache::Pipeline* PipelineCache::AdoptAsyncGraphics(GraphicsPipelineKey&                   key,
+                                                           std::span<const ShaderVertexInputInfo> vertex_info,
+                                                           const ShaderPixelInputInfo*            ps_input_info,
+                                                           const GraphicsPrograms&                programs) {
+	std::unique_ptr<Pipeline> pipeline;
+	{
+		const std::lock_guard lock(m_async_graphics_mutex);
+		if (auto found = m_async_graphics_pipelines.find(key); found != m_async_graphics_pipelines.end()) {
+			pipeline = std::move(found->second);
+			m_async_graphics_pipelines.erase(found);
+		} else {
+			m_inline_graphics_keys.insert(key);
+		}
+	}
+	if (pipeline == nullptr) {
+		return nullptr;
+	}
+	const auto begin  = std::chrono::steady_clock::now();
+	pipeline->prebuilt = false;
+	const bool same_inputs =
+	    vertex_info.size() == 1 &&
+	    pipeline->input_check == GraphicsInputCheck(key.vertex_input, key.static_params, vertex_info[0], ps_input_info);
+	if (same_inputs) {
+		m_async_graphics_adopted++;
+	} else {
+		m_async_graphics_rebuilt++;
+		DestroyPipeline(*pipeline);
+		CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input, vertex_info, ps_input_info,
+		                       programs, key.static_params, m_driver_cache);
+		m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+		EXIT_NOT_IMPLEMENTED(pipeline->pipeline == nullptr);
+		EXIT_NOT_IMPLEMENTED(pipeline->pipeline_layout == nullptr);
+	}
+	LogFirstUse(same_inputs ? "graphics-async" : "graphics-async-rebuilt", begin, key.vertex_shader_ids[0],
+	            key.ps_shader_id);
+	LogAsyncGraphics(false);
+	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(pipeline));
+	EXIT_IF(!inserted);
+	CheckpointDriverCache();
+	if (Common::RuntimeFlags::Current().pipeline_memo || FrameBreakdown::Verbose()) {
+		m_last_key      = iter->first;
+		m_last_pipeline = iter->second.get();
+	}
+	return iter->second.get();
+}
+
+// NHL27ASYNCGFX (execution thread): the first 20 events, then at most every 2 s.
+void PipelineCache::LogAsyncGraphics(bool force) {
+	const auto now   = std::chrono::steady_clock::now();
+	const auto total = m_async_graphics_adopted + m_async_graphics_rebuilt + m_async_graphics_inline;
+	if (!force && total > 20 && now - m_async_graphics_logged < std::chrono::seconds(2)) {
+		return;
+	}
+	m_async_graphics_logged = now;
+	size_t unused           = 0;
+	{
+		const std::lock_guard lock(m_async_graphics_mutex);
+		unused = m_async_graphics_pipelines.size();
+	}
+	std::printf("NHL27ASYNCGFX: adopted=%llu rebuilt=%llu inline=%llu worker_created=%llu worker_failed=%llu "
+	            "drawn_first=%llu unused=%zu\n",
+	            static_cast<unsigned long long>(m_async_graphics_adopted),
+	            static_cast<unsigned long long>(m_async_graphics_rebuilt),
+	            static_cast<unsigned long long>(m_async_graphics_inline),
+	            static_cast<unsigned long long>(m_async_graphics_created.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(m_async_graphics_failed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(m_async_graphics_late.load(std::memory_order_relaxed)), unused);
+	std::fflush(stdout);
+}
+
+// NHL27PIPEBUDGET (execution thread, KYTY_PIPELINE_WAIT_BUDGET_MS): a first-use graphics pipeline
+// create slower than the budget, which a time limit would have skipped. The line names the target
+// formats of the last one; printed at most every 2 s, when the count changed.
+void PipelineCache::NotePipelineWait(const GraphicsPipelineKey& key, std::chrono::nanoseconds took) {
+	if (took <= m_pipeline_wait_budget) {
+		return;
+	}
+	const double ms = std::chrono::duration<double, std::milli>(took).count();
+	m_budget_over++;
+	m_budget_max_ms = std::max(m_budget_max_ms, ms);
+	const auto now  = std::chrono::steady_clock::now();
+	if (m_budget_over_logged != 0 && now - m_budget_logged < std::chrono::seconds(2)) {
+		return;
+	}
+	m_budget_logged      = now;
+	m_budget_over_logged = m_budget_over;
+	std::printf("NHL27PIPEBUDGET: would_skip=%llu max_ms=%.1f last_ms=%.1f colors=%u color0=%s depth=%s\n",
+	            static_cast<unsigned long long>(m_budget_over), m_budget_max_ms, ms,
+	            static_cast<unsigned>(key.rendering.color_count),
+	            key.rendering.color_count != 0 ? vk::to_string(key.rendering.color_formats[0]).c_str() : "none",
+	            vk::to_string(key.rendering.depth_format).c_str());
+	std::fflush(stdout);
+}
+
+PipelineCache::CompileStateForTests PipelineCache::CompileState() {
+	CompileStateForTests state;
+	const auto           stats = m_program_cache->queue.Stats();
+	state.urgent_first         = m_program_cache->urgent_first;
+	state.two_classes          = m_program_cache->queue.TwoClasses();
+	state.queued               = stats.live_left + stats.stored_left;
+	state.stored_pending       = m_program_cache->stored_pending.load(std::memory_order_acquire);
+	state.workers              = m_program_cache->workers.size();
+	state.taken                = stats.taken;
+	const ProgramLockGuard lock(m_program_lock);
+	state.in_flight = m_program_cache->in_flight.size();
+	return state;
+}
+
+// Compile worker (KYTY_ASYNC_COMPUTE_PIPELINES): null when the create failed; the execution
+// thread then creates the pipeline itself and reports the error.
+std::unique_ptr<PipelineCache::Pipeline>
+PipelineCache::CreateComputePipelineOnWorker(const ShaderComputeInputInfo& input_info, vk::ShaderModule module) {
+	auto pipeline = std::make_unique<Pipeline>();
+	try {
+		const Common::SoftExitScope soft_exit(true);
+		const std::shared_lock      guard(m_driver_cache_guard);
+		CreatePipelineInternal(m_graphics, *pipeline, input_info, module, m_driver_cache);
+	} catch (const Common::SoftExitError& error) {
+		std::printf("NHL27ASYNCCS: worker create failed (%s); the dispatch creates it\n", error.what());
+		std::fflush(stdout);
+		DestroyPipeline(*pipeline);
+		m_async_compute_failed.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	if (pipeline->pipeline == nullptr || pipeline->pipeline_layout == nullptr) {
+		DestroyPipeline(*pipeline);
+		m_async_compute_failed.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	m_async_compute_created.fetch_add(1, std::memory_order_relaxed);
+	return pipeline;
+}
+
+// Compile worker, under the program lock.
+void PipelineCache::PublishComputePipeline(uint64_t program_id, std::unique_ptr<Pipeline> pipeline) {
+	const std::lock_guard lock(m_async_compute_mutex);
+	auto [iter, inserted] = m_async_compute_pipelines.try_emplace(program_id, std::move(pipeline));
+	if (!inserted) {
+		// Program ids are unique, so this does not happen; never leak the pipeline if it did.
+		DestroyPipeline(*pipeline);
+	}
+}
+
+// NHL27ASYNCCS: whether the first dispatches of new compute programs found their pipeline made
+// by a worker (adopted) or created it on the execution thread (inline: indirect dispatches,
+// programs the resolve thread did not see first, failed worker creates). Printed for the first 20
+// and then at most every 2 s.
+void PipelineCache::LogAsyncCompute(bool adopted) {
+	(adopted ? m_async_compute_adopted : m_inline_compute_created)++;
+	const auto now   = std::chrono::steady_clock::now();
+	const auto total = m_async_compute_adopted + m_inline_compute_created;
+	if (total > 20 && now - m_async_compute_logged < std::chrono::seconds(2)) {
+		return;
+	}
+	m_async_compute_logged = now;
+	size_t pending         = 0;
+	{
+		const std::lock_guard lock(m_async_compute_mutex);
+		pending = m_async_compute_pipelines.size();
+	}
+	std::printf("NHL27ASYNCCS: adopted=%llu inline=%llu worker_created=%llu worker_failed=%llu unused=%zu\n",
+	            static_cast<unsigned long long>(m_async_compute_adopted),
+	            static_cast<unsigned long long>(m_inline_compute_created),
+	            static_cast<unsigned long long>(m_async_compute_created.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(m_async_compute_failed.load(std::memory_order_relaxed)), pending);
+	std::fflush(stdout);
 }
 } // namespace Libs::Graphics

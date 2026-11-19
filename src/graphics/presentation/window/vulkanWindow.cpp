@@ -18,6 +18,7 @@
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/fsr/dlssBridge.h"
+#include "graphics/presentation/fsr/frameGen.h"
 #include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -536,9 +537,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 				}
 				return static_cast<uint32_t>(-1);
 			};
-			const uint32_t compute  = find(vk::QueueFlagBits::eCompute, vk::QueueFlagBits::eGraphics);
+			// With Streamline the optical-flow family stays its own (frame generation).
+			const vk::QueueFlags frame_gen_reject {FrameGen::RejectedQueueFlags()};
+			const uint32_t compute  = find(vk::QueueFlagBits::eCompute, vk::QueueFlagBits::eGraphics | frame_gen_reject);
 			const uint32_t transfer = find(vk::QueueFlagBits::eTransfer,
-			                               vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute);
+			                               vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute |
+			                                   frame_gen_reject);
 			for (const auto family: {compute, transfer}) {
 				if (family == static_cast<uint32_t>(-1)) {
 					continue;
@@ -1321,6 +1325,8 @@ void WindowContext::CreateVulkan() {
 	if (get_instance_proc_addr == nullptr) {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
+	// KYTY_DLSSG=1: Streamline's loader (frameGen.h); otherwise SDL's, exactly as before.
+	get_instance_proc_addr = FrameGen::LoaderBeforeInstance(get_instance_proc_addr);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	NvxSelfTest("T5_window");
@@ -1424,9 +1430,12 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	// With Streamline the surface is created through it (it hooks surface creation); SDL otherwise.
+	vk::SurfaceKHR::CType native_surface =
+	    FrameGen::CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance));
+	if (native_surface == VK_NULL_HANDLE &&
+	    !SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance), nullptr,
+	                              &native_surface)) {
 		EXIT("Could not create a Vulkan surface");
 	}
 	surface = native_surface;
@@ -1603,6 +1612,10 @@ void WindowContext::CreateVulkan() {
 	std::printf("NHL27DEVICE create begin extensions=%zu\n", device_extensions.size());
 	std::fflush(stdout);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	if (graphic_ctx.device == nullptr && FrameGen::Active()) {
+		// The instance already runs through Streamline: no retry can undo that in this process.
+		EXIT("NHL27FG: device creation failed with Streamline loaded; turn frame generation off (KYTY_DLSSG=0)\n");
+	}
 	if (graphic_ctx.device == nullptr && !ngx_extensions.empty()) {
 		// The extensions DLSS asked for can still make creation fail (see DlssWarmUp). The game runs fine on its own
 		// upscaler chain without them: drop them, turn DLSS off for this session and try once more.
@@ -1619,6 +1632,7 @@ void WindowContext::CreateVulkan() {
 	std::printf("NHL27DEVICE created\n");
 	std::fflush(stdout);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	FrameGen::AfterDevice(graphic_ctx);
 	std::printf("NHL27DEVICE dispatcher ok\n");
 	std::fflush(stdout);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
@@ -1661,9 +1675,11 @@ void WindowContext::RecreateSurface() {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
 	}
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	vk::SurfaceKHR::CType native_surface =
+	    FrameGen::CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance));
+	if (native_surface == VK_NULL_HANDLE &&
+	    !SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance), nullptr,
+	                              &native_surface)) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
 	surface = native_surface;
@@ -1678,6 +1694,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		FrameGen::Shutdown(static_cast<vk::Device::CType>(graphic_ctx.device));
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

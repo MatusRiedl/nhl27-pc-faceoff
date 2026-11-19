@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
+#include "graphics/presentation/fsr/frameGen.h"
 #include <chrono>
 #include <fmt/format.h>
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -2248,6 +2249,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	DbgLogSmallTextureDraw(state.ps_active ? &*bindings.pixel : nullptr, state, draw, crumb_vs,
 	                       crumb_ps);
+	// DLSS frame generation's camera (KYTY_DLSSG_CAMERA_SCAN=1, frameGen.h): the vertex shader's buffers.
+	if (static const bool camera_scan = FrameGen::CameraScanEnabled(); camera_scan && crumb_vs != 0) {
+		const auto& sources = bindings.vertex[0].buffer_sources;
+		for (size_t slot = 0; slot < sources.size(); slot++) {
+			FrameGen::CameraScanBuffer(crumb_vs, static_cast<uint32_t>(slot), sources[slot].address,
+			                           sources[slot].size);
+		}
+	}
 	// Debugging: KYTY_DBG_SKIP_PS=<hex hash>[,<hex hash>...] skips matching pixel shaders.
 	static const std::vector<uint64_t> skip_ps = [] {
 		std::vector<uint64_t> list;

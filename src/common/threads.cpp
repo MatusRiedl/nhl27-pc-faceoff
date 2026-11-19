@@ -2,7 +2,9 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
@@ -215,6 +217,95 @@ void Thread::RaiseCurrentPriority() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
+}
+
+const Thread::CpuTopology& Thread::GetCpuTopology() {
+	static const CpuTopology topology = [] {
+		CpuTopology result;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		DWORD length = 0;
+		(void)::GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+		if (length == 0) {
+			return result;
+		}
+		std::unique_ptr<uint8_t[]> buffer(new uint8_t[length]);
+		auto* const first = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.get());
+		if (::GetLogicalProcessorInformationEx(RelationProcessorCore, first, &length) == 0) {
+			return result;
+		}
+		struct Core {
+			uint64_t mask;
+			BYTE     efficiency;
+		};
+		Core     cores[64] {};
+		uint32_t count       = 0;
+		BYTE     fastest     = 0;
+		BYTE     slowest     = 0xff;
+		for (DWORD at = 0; at < length;) {
+			const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.get() + at);
+			if (info->Size == 0) {
+				break;
+			}
+			at += info->Size;
+			if (info->Relationship != RelationProcessorCore || info->Processor.GroupCount == 0 ||
+			    info->Processor.GroupMask[0].Group != 0 || info->Processor.GroupMask[0].Mask == 0 || count == 64) {
+				continue;
+			}
+			const auto mask = static_cast<uint64_t>(info->Processor.GroupMask[0].Mask);
+			cores[count++]  = {mask, info->Processor.EfficiencyClass};
+			fastest         = std::max(fastest, info->Processor.EfficiencyClass);
+			slowest         = std::min(slowest, info->Processor.EfficiencyClass);
+			result.logical += static_cast<uint32_t>(std::popcount(mask));
+			for (auto bits = mask; bits != 0; bits &= bits - 1) {
+				result.core_mask[std::countr_zero(bits)] = mask;
+			}
+		}
+		if (count == 0) {
+			return result;
+		}
+		std::sort(cores, cores + count, [](const Core& a, const Core& b) {
+			return std::countr_zero(a.mask) < std::countr_zero(b.mask);
+		});
+		for (uint32_t index = 0; index < count; index++) {
+			if (cores[index].efficiency == fastest) {
+				result.fast_core_first[result.fast_cores++] = std::countr_zero(cores[index].mask);
+			}
+		}
+		result.cores  = count;
+		result.hybrid = fastest != slowest;
+		result.valid  = true;
+#endif
+		return result;
+	}();
+	return topology;
+}
+
+uint32_t Thread::CompileWorkerCount(const CpuTopology& topology, const char* env, const char** rule) {
+	const auto name = [&](const char* text) {
+		if (rule != nullptr) {
+			*rule = text;
+		}
+	};
+	const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+	if (env != nullptr && digit(env[0]) && (env[1] == '\0' || (digit(env[1]) && env[2] == '\0'))) {
+		const auto value = static_cast<uint32_t>(env[1] == '\0' ? env[0] - '0' : (env[0] - '0') * 10 + (env[1] - '0'));
+		if (value >= 1 && value <= 16) {
+			name("env");
+			return value;
+		}
+		// "0": the fixed number of every build before 2026-11-19.
+		if (value == 0) {
+			name("fixed");
+			return 6;
+		}
+	}
+	if (!topology.valid || topology.cores == 0) {
+		name("unknown");
+		return 6;
+	}
+	name("cores");
+	const uint32_t spare = topology.cores > 2 ? topology.cores - 2 : 0;
+	return std::clamp<uint32_t>(spare, 6, 10);
 }
 
 void Thread::PinCurrent(int logical_cpu) {

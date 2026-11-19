@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/processExit.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -71,6 +72,9 @@ const char** GetArgv() {
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
+	if (Common::TerminateOnExit()) {
+		Common::DbgExit(code); // ::exit ends in ExitProcess (common/processExit.h)
+	}
 	::exit(code);
 }
 
