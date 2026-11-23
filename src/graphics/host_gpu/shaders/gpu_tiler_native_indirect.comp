@@ -1,13 +1,35 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Prepares native indirect draw records in their snapshot before the draw reads them:
+//  - clamps an indexed record's index count to the index buffer, as the CP does (limit; UINT32_MAX
+//    for non-indexed records);
+//  - zeroes a record whose count x instance count exceeds max_work (0: off). Such a draw runs for
+//    seconds and the driver resets the device: NHL 27's VS 5862e85c draw (non-indexed, one record)
+//    was the active shader of a device hang (Aftermath dump, 2026-11-23).
+// Word 0 of both record layouts is the vertex or index count, word 1 the instance count.
 layout(local_size_x=64) in;
 layout(buffer_reference, std430, buffer_reference_align=4) buffer Arguments { uint words[]; };
+// Read by the CPU for the NHL27DRAWGUARD lines (nativeIndirect.cpp; offsets 0, 16, 24, 32, 160).
+layout(buffer_reference, std430, buffer_reference_align=8) buffer Report {
+ uint trips;
+ uint checked;
+ uint max_work;
+ uint reserved;
+ uint64_t max_address;
+ uvec2 max_values;
+ uint64_t addresses[16];
+ uvec2 values[16];
+};
 layout(push_constant, std430) uniform Params {
  uint64_t address;
+ uint64_t report;
+ uint64_t guest_address;
  uint stride;
  uint maximum;
  uint limit;
+ uint max_work;
+ uint count_word;
  uint reserved;
 } p;
 void main() {
@@ -15,5 +37,27 @@ void main() {
  if (record >= p.maximum) return;
  Arguments args = Arguments(p.address);
  uint offset = record * p.stride;
- args.words[offset] = min(args.words[offset], p.limit);
+ uint raw = args.words[offset];
+ uint count = min(raw, p.limit);
+ uint instances = args.words[offset + 1u];
+ uint64_t work = uint64_t(count) * uint64_t(instances);
+ bool bad = p.max_work != 0u && work > uint64_t(p.max_work);
+ args.words[offset] = bad ? 0u : count;
+ if (bad) args.words[offset + 1u] = 0u;
+ // Records past the draw count are never drawn: zeroed above when bad, but not reported.
+ if (p.max_work == 0u || record >= args.words[p.count_word]) return;
+ Report report = Report(p.report);
+ atomicAdd(report.checked, 1u);
+ uint64_t address = p.guest_address + uint64_t(offset) * 4ul;
+ if (bad) {
+  uint index = atomicAdd(report.trips, 1u) % 16u;
+  report.addresses[index] = address;
+  report.values[index] = uvec2(raw, instances);
+  return;
+ }
+ uint saturated = uint(min(work, uint64_t(0xffffffffu)));
+ if (atomicMax(report.max_work, saturated) < saturated) {
+  report.max_address = address;
+  report.max_values = uvec2(count, instances);
+ }
 }

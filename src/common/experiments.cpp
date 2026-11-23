@@ -429,8 +429,9 @@ constexpr int MaxThreads = 8;
 constexpr int MaxFrames  = 24;
 
 struct Target {
-	HANDLE      handle = nullptr;
-	const char* name   = nullptr;
+	HANDLE      handle     = nullptr;
+	const char* name       = nullptr;
+	uint64_t    stack_high = 0;  // top of the thread's stack (GetCurrentThreadStackLimits)
 };
 
 struct SamplerState {
@@ -455,9 +456,61 @@ bool SamplingEnabled() {
 
 // Walks the suspended thread's stack with the x64 unwind tables. Nothing here may allocate or
 // take a lock the target could hold (heap, CRT): the target is suspended meanwhile.
-int Unwind(CONTEXT context, uint64_t* functions) {
-	int depth = 0;
+// A fault here ends the process (the vectored handler treats it as fatal), so every stack read
+// must stay in [sampled rsp, stack top): that range is committed. A frame that would leave it
+// (a wrong return address after the leaf guess, a frame register that is not a stack address)
+// ends the walk.
+// Bytes from a frame's base up to its return address: the pushes and allocations in the unwind codes
+// of `entry` and of the entries it chains to. -1 = an op this parser does not know (the walk stops).
+// Slot counts as in the x64 unwind format (version 2 adds the 2-slot epilog op 6).
+int64_t FrameBytes(uint64_t image_base, const RUNTIME_FUNCTION* entry) {
+	int64_t bytes = 0;
+	for (int chain = 0; chain < 8; chain++) {
+		const auto*    info    = reinterpret_cast<const uint8_t*>(image_base + entry->UnwindData);
+		const uint32_t version = info[0] & 7u;
+		const uint32_t flags   = info[0] >> 3u;
+		const uint32_t count   = info[2];
+		if (version != 1 && version != 2) return -1;
+		const auto* codes = reinterpret_cast<const uint16_t*>(info + 4);
+		for (uint32_t c = 0; c < count;) {
+			const uint32_t op     = (codes[c] >> 8u) & 0x0fu;
+			const uint32_t opinfo = codes[c] >> 12u;
+			switch (op) {
+				case 0: bytes += 8; c += 1; break;  // UWOP_PUSH_NONVOL
+				case 1:                             // UWOP_ALLOC_LARGE
+					if (opinfo == 0) {
+						if (c + 1 >= count) return -1;
+						bytes += static_cast<int64_t>(codes[c + 1]) * 8;
+						c += 2;
+					} else {
+						if (c + 2 >= count) return -1;
+						bytes += static_cast<int64_t>(codes[c + 1] | (static_cast<uint32_t>(codes[c + 2]) << 16u));
+						c += 3;
+					}
+					break;
+				case 2: bytes += static_cast<int64_t>(opinfo) * 8 + 8; c += 1; break;  // UWOP_ALLOC_SMALL
+				case 3: c += 1; break;                                                // UWOP_SET_FPREG
+				case 4:                                                               // UWOP_SAVE_NONVOL
+				case 6:                                                               // UWOP_EPILOG (v2)
+				case 8: c += 2; break;                                                // UWOP_SAVE_XMM128
+				case 5:                                                               // UWOP_SAVE_NONVOL_FAR
+				case 9: c += 3; break;                                                // UWOP_SAVE_XMM128_FAR
+				case 10: bytes += opinfo != 0 ? 48 : 40; c += 1; break;               // UWOP_PUSH_MACHFRAME
+				default: return -1;
+			}
+		}
+		if ((flags & UNW_FLAG_CHAININFO) == 0) return bytes;
+		entry = reinterpret_cast<const RUNTIME_FUNCTION*>(codes + ((count + 1u) & ~1u));
+	}
+	return -1;
+}
+
+int Unwind(CONTEXT context, uint64_t stack_high, uint64_t* functions) {
+	const uint64_t floor    = context.Rsp;
+	const auto     in_stack = [&](uint64_t a) { return a >= floor && a < stack_high && stack_high - a >= 8; };
+	int            depth    = 0;
 	for (int i = 0; i < MaxFrames && context.Rip != 0; i++) {
+		if (stack_high == 0 || !in_stack(context.Rsp)) break;
 		DWORD64 image_base = 0;
 		auto*   entry      = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
 		if (entry == nullptr) {
@@ -469,15 +522,87 @@ int Unwind(CONTEXT context, uint64_t* functions) {
 			continue;
 		}
 		functions[depth++] = image_base + entry->BeginAddress;
-		void*   handler_data = nullptr;
-		DWORD64 establisher  = 0;
+		if ((entry->UnwindData & 1u) != 0) break;  // indirect entry: not followed
+		// UNWIND_INFO byte 3, low nibble: frame register (0 = none; 1..15 = rcx..r15 in CONTEXT order).
+		const uint8_t  frame_byte = reinterpret_cast<const uint8_t*>(image_base + entry->UnwindData)[3];
+		const auto     frame_reg  = static_cast<uint32_t>(frame_byte & 0x0fu);
+		const DWORD64* regs       = &context.Rax;
+		if (frame_reg != 0 && !in_stack(regs[frame_reg])) break;
+		// The unwind reads up to the return address at base + frame bytes; base is RSP, or the frame
+		// register minus 16 x its offset once the prologue set it. Both must leave that read in the stack.
+		const int64_t frame_bytes = FrameBytes(image_base, entry);
+		if (frame_bytes < 0 || frame_bytes > static_cast<int64_t>(stack_high - floor)) break;
+		uint64_t base = context.Rsp;
+		if (frame_reg != 0) {
+			const uint64_t fp_base = regs[frame_reg] - 16u * static_cast<uint64_t>(frame_byte >> 4u);
+			base                   = std::max(base, fp_base);
+		}
+		if (base < floor || stack_high - base < static_cast<uint64_t>(frame_bytes) + 8u) break;
+		const uint64_t rsp_before   = context.Rsp;
+		void*          handler_data = nullptr;
+		DWORD64        establisher  = 0;
 		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context, &handler_data,
 		                 &establisher, nullptr);
+		if (context.Rsp <= rsp_before) break;
 	}
 	return depth;
 }
 
+// Seconds since this process was created. The game's NHL27FPS t (SDL ticks) starts a fraction of a second later.
+double UptimeSeconds() {
+	static const uint64_t created = [] {
+		FILETIME c {};
+		FILETIME e {};
+		FILETIME k {};
+		FILETIME u {};
+		GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+		return (static_cast<uint64_t>(c.dwHighDateTime) << 32u) | c.dwLowDateTime;
+	}();
+	FILETIME now {};
+	GetSystemTimePreciseAsFileTime(&now);
+	const uint64_t n = (static_cast<uint64_t>(now.dwHighDateTime) << 32u) | now.dwLowDateTime;
+	return n > created ? static_cast<double>(n - created) / 1e7 : 0.0;
+}
+
+struct SampleWindow {
+	double from = 0.0;
+	double to   = 0.0;
+};
+
+// KYTY_PERF_SAMPLE_AT="130-143,184-191": sample only inside these uptime windows (seconds). Unset: always.
+std::vector<SampleWindow> SampleWindows() {
+	std::vector<SampleWindow> windows;
+	const char*               p = std::getenv("KYTY_PERF_SAMPLE_AT");
+	while (p != nullptr && *p != '\0') {
+		char*        end  = nullptr;
+		const double from = std::strtod(p, &end);
+		if (end == p || *end != '-') break;
+		p               = end + 1;
+		const double to = std::strtod(p, &end);
+		if (end == p) break;
+		if (to > from) windows.push_back({from, to});
+		p = end;
+		if (*p == ',') p++;
+	}
+	return windows;
+}
+
 void Run() {
+	// KYTY_PERF_SAMPLE_MS: print interval (default 10000 ms). A block is also printed when a window ends.
+	int64_t interval_ms = 10000;
+	if (const char* value = std::getenv("KYTY_PERF_SAMPLE_MS"); value != nullptr && std::atoll(value) >= 100) {
+		interval_ms = std::atoll(value);
+	}
+	const auto windows = SampleWindows();
+	std::printf("NHL27SAMPLE: interval_ms=%lld windows=%zu\n", static_cast<long long>(interval_ms), windows.size());
+	const auto in_window = [&](double up) {
+		if (windows.empty()) return true;
+		for (const auto& w: windows) {
+			if (up >= w.from && up < w.to) return true;
+		}
+		return false;
+	};
+	bool was_active = false;
 	struct Counts {
 		std::unordered_map<uint64_t, uint64_t> self;
 		std::unordered_map<uint64_t, uint64_t> incl;
@@ -503,14 +628,16 @@ void Run() {
 			targets = s.targets;
 			n       = s.count;
 		}
-		for (int t = 0; t < n; t++) {
+		const double up     = UptimeSeconds();
+		const bool   active = in_window(up);
+		for (int t = 0; t < n && active; t++) {
 			uint64_t functions[MaxFrames] {};
 			int      depth = 0;
 			if (SuspendThread(targets[t].handle) == static_cast<DWORD>(-1)) continue;
 			CONTEXT context {};
 			context.ContextFlags = CONTEXT_FULL;
 			if (GetThreadContext(targets[t].handle, &context) != 0) {
-				depth = Unwind(context, functions);
+				depth = Unwind(context, targets[t].stack_high, functions);
 			}
 			ResumeThread(targets[t].handle);
 			if (depth == 0) continue;
@@ -531,8 +658,13 @@ void Run() {
 				e.count++;
 			}
 		}
-		const auto now = std::chrono::steady_clock::now();
-		if (now - last < std::chrono::seconds(10)) continue;
+		const auto now      = std::chrono::steady_clock::now();
+		const bool window_end = was_active && !active;
+		was_active            = active;
+		if (!window_end && (!active || now - last < std::chrono::milliseconds(interval_ms))) {
+			if (!active) last = now;
+			continue;
+		}
 		last = now;
 		for (int t = 0; t < n; t++) {
 			auto& c = counts[t];
@@ -546,7 +678,7 @@ void Run() {
 					            sorted[i].first);
 				}
 			};
-			std::printf("NHL27SAMPLE: thread=%s samples=%" PRIu64 "\n", targets[t].name, c.samples);
+			std::printf("NHL27SAMPLE: thread=%s samples=%" PRIu64 " up=%.2f\n", targets[t].name, c.samples, up);
 			print("self", c.self, 30);
 			print("incl", c.incl, 80);
 			{
@@ -575,10 +707,13 @@ void RegisterCurrentThread(const char* name) noexcept {
 	                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0) == 0) {
 		return;
 	}
+	ULONG_PTR stack_low  = 0;
+	ULONG_PTR stack_high = 0;
+	GetCurrentThreadStackLimits(&stack_low, &stack_high);
 	auto&            s = GetSampler();
 	std::scoped_lock guard(s.lock);
 	if (s.count == MaxThreads) return;
-	s.targets[static_cast<size_t>(s.count++)] = {handle, name};
+	s.targets[static_cast<size_t>(s.count++)] = {handle, name, static_cast<uint64_t>(stack_high)};
 	if (!s.started) {
 		s.started = true;
 		std::thread(Run).detach();

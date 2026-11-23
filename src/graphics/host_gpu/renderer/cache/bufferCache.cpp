@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/eventFlag.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -2234,13 +2235,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			break;
 		}
 		RdSplitSpan span(trace, RdRetry, split);
-		m_scheduler.WaitSubmitted(retry_tick);
-		m_scheduler.GetMasterSemaphore().Wait(retry_tick);
+		const uint64_t wait_start = RetryWriterSubmit(retry_tick);
+		RetryWriterWait(retry_tick, vaddr, attempt, wait_start);
 	}
 	if (async_tick != 0) {
 		{
 			RdSplitSpan span(trace, RdWait, split);
-			m_scheduler.WaitPriorityOperations(async_tick);
+			AsyncReadWait(async_tick);
 		}
 		const uint64_t split_sent = split ? FrameBreakdown::NowNs() : 0;
 		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, split, &trace] {
@@ -2257,6 +2258,136 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	if (split) {
 		RdSplitCommit(trace, is_write, FrameBreakdown::NowNs() - split_start);
 	}
+}
+
+namespace {
+
+// KYTY_READ_WAIT_ESCAPE_MS=<ms>: the writer-tick wait budget of RetryWriterWait (default 25,
+// 0 = the v0.30.0 unbounded wait with no escape).
+uint64_t ReadWaitEscapeNs() {
+	static const uint64_t ns = [] {
+		const char* value = std::getenv("KYTY_READ_WAIT_ESCAPE_MS");
+		if (value == nullptr || value[0] == '\0') {
+			return uint64_t {25} * 1000000u;
+		}
+		return static_cast<uint64_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 1000ul)) * 1000000u;
+	}();
+	return ns;
+}
+
+// NHL27RDWAIT: guest-thread read waits, always counted (a few relaxed adds per wait, and a
+// wait is a blocking call). retry = waits for an unfinished GPU writer (submit = the part spent
+// until the writer's command buffer was submitted); escape = the waits that outlived the budget,
+// timed from the forced Flush to completion; async = waits for an async read's tick.
+struct ReadWaitStats {
+	std::atomic<uint64_t> retry_n {0};
+	std::atomic<uint64_t> retry_ns {0};
+	std::atomic<uint64_t> retry_max {0};
+	std::atomic<uint64_t> submit_ns {0};
+	std::atomic<uint64_t> escapes {0};
+	std::atomic<uint64_t> escape_ns {0};
+	std::atomic<uint64_t> escape_max {0};
+	std::atomic<uint64_t> async_n {0};
+	std::atomic<uint64_t> async_ns {0};
+	std::atomic<uint64_t> async_max {0};
+};
+ReadWaitStats g_read_wait;
+
+void ReadWaitMax(std::atomic<uint64_t>& slot, uint64_t value) {
+	uint64_t seen = slot.load(std::memory_order_relaxed);
+	while (seen < value && !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+	}
+}
+
+} // namespace
+
+// A guest read gated on an unfinished GPU writer (duy64 e5afd69c). The retry gate flushed the
+// writer if it was in the open command buffer, so the tick is submitted or about to be. In a
+// low-fps feedback loop the writer wait stretched to ~500 ms while the pipeline sat idle (reads
+// wait for ticks, ticks wait for game progress, and the game threads are the ones waiting): the
+// ordinary download path force-submits the open command buffer on every read, the direct-read
+// path does not. So a wait that outlives the budget sends one Flush on the execution thread,
+// through the same urgent-command route and the same call the retry gate makes, then waits as
+// before. No locks are held here and the gate only fires for !on_gpu callers, so the waiting
+// thread is never the execution thread and the Flush cannot wait on it. The read is never
+// skipped; a writer that completes within the budget behaves as before.
+//
+// ReadMemory calls RetryWriterSubmit and RetryWriterWait where v0.30.0 called WaitSubmitted and
+// Wait: two out-of-line calls that may throw, as before, so ReadMemory's control flow (and its PGO
+// profile, which hashes the CFG after early inlining) stays the same. Keep both noinline and not
+// noexcept for that reason.
+[[gnu::noinline]] uint64_t BufferCache::RetryWriterSubmit(uint64_t retry_tick) {
+	const uint64_t start = FrameBreakdown::NowNs();
+	m_scheduler.WaitSubmitted(retry_tick);
+	g_read_wait.submit_ns.fetch_add(FrameBreakdown::NowNs() - start, std::memory_order_relaxed);
+	return start;
+}
+
+[[gnu::noinline]] void BufferCache::RetryWriterWait(uint64_t retry_tick, uint64_t vaddr, uint32_t attempt,
+                                                    uint64_t start) {
+	auto&          master    = m_scheduler.GetMasterSemaphore();
+	const uint64_t budget    = ReadWaitEscapeNs();
+	if (budget == 0) {
+		master.Wait(retry_tick);
+	} else if (!master.WaitFor(retry_tick, budget)) {
+		static std::atomic<uint32_t> escape_lines {0};
+		if (escape_lines.fetch_add(1, std::memory_order_relaxed) < 200) {
+			std::printf("NHL27RDESCAPE: vaddr=0x%016" PRIx64 " tick=%" PRIu64 " current=%" PRIu64
+			            " gpu=%" PRIu64 " attempt=%u budget_ms=%" PRIu64 "\n",
+			            vaddr, retry_tick, m_scheduler.CurrentTick(), master.KnownGpuTick(), attempt,
+			            budget / 1000000u);
+			std::fflush(stdout);
+		}
+		const uint64_t escape_start = FrameBreakdown::NowNs();
+		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this] { m_scheduler.Flush(); });
+		m_scheduler.WaitSubmitted(retry_tick);
+		master.Wait(retry_tick);
+		const uint64_t after = FrameBreakdown::NowNs() - escape_start;
+		g_read_wait.escapes.fetch_add(1, std::memory_order_relaxed);
+		g_read_wait.escape_ns.fetch_add(after, std::memory_order_relaxed);
+		ReadWaitMax(g_read_wait.escape_max, after);
+	}
+	const uint64_t total = FrameBreakdown::NowNs() - start;
+	g_read_wait.retry_n.fetch_add(1, std::memory_order_relaxed);
+	g_read_wait.retry_ns.fetch_add(total, std::memory_order_relaxed);
+	ReadWaitMax(g_read_wait.retry_max, total);
+}
+
+// Out of line for the same reason as RetryWriterWait (it stands where WaitPriorityOperations was).
+[[gnu::noinline]] void BufferCache::AsyncReadWait(uint64_t async_tick) {
+	const uint64_t start = FrameBreakdown::NowNs();
+	m_scheduler.WaitPriorityOperations(async_tick);
+	const uint64_t ns = FrameBreakdown::NowNs() - start;
+	g_read_wait.async_n.fetch_add(1, std::memory_order_relaxed);
+	g_read_wait.async_ns.fetch_add(ns, std::memory_order_relaxed);
+	ReadWaitMax(g_read_wait.async_max, ns);
+}
+
+void BufferCachePrintReadWaits() {
+	auto take_ms = [](std::atomic<uint64_t>& slot) {
+		return static_cast<double>(slot.exchange(0, std::memory_order_relaxed)) / 1e6;
+	};
+	auto take = [](std::atomic<uint64_t>& slot) {
+		return static_cast<unsigned long long>(slot.exchange(0, std::memory_order_relaxed));
+	};
+	auto& s = g_read_wait;
+	const auto retry_n   = take(s.retry_n);
+	const auto retry_ms  = take_ms(s.retry_ns);
+	const auto retry_max = take_ms(s.retry_max);
+	const auto submit_ms = take_ms(s.submit_ns);
+	const auto escapes   = take(s.escapes);
+	const auto escape_ms = take_ms(s.escape_ns);
+	const auto escape_mx = take_ms(s.escape_max);
+	const auto async_n   = take(s.async_n);
+	const auto async_ms  = take_ms(s.async_ns);
+	const auto async_max = take_ms(s.async_max);
+	std::printf("NHL27RDWAIT: retry_n=%llu retry_ms=%.1f retry_max_ms=%.1f submit_ms=%.1f escapes=%llu "
+	            "escape_after_ms=%.1f escape_after_max_ms=%.1f async_n=%llu async_ms=%.1f async_max_ms=%.1f "
+	            "budget_ms=%llu\n",
+	            retry_n, retry_ms, retry_max, submit_ms, escapes, escape_ms, escape_mx, async_n, async_ms, async_max,
+	            static_cast<unsigned long long>(ReadWaitEscapeNs() / 1000000u));
+	// NHL27EVFLAG rides on this 5 s call (it prints every 30 s), so the per-frame caller stays as it is.
+	Libs::LibKernel::EventFlag::PrintEventFlagStats();
 }
 
 void BufferCache::NoteAsyncReadbackWrite(uint64_t vaddr, uint64_t size) {

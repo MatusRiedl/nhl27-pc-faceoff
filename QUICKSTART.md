@@ -2,7 +2,7 @@
 
 ## 1. Install
 
-1. Download `Faceoff-v0.30.0.zip` from the [release page](../../releases/latest).
+1. Download `Faceoff-v0.20.0.zip` from the [release page](../../releases/latest).
 2. Extract it anywhere you can write to, with at least 2 GB free. Not inside `Program Files`.
 3. Start `Faceoff.exe`. If Windows SmartScreen warns, choose **More info**, then **Run anyway**. If Faceoff asks for
    Microsoft's WebView2 Runtime, install it and start Faceoff again.
@@ -18,14 +18,10 @@ Press **Browse** on the Play tab and pick your NHL 27 folder, the one that holds
 
 ## 3. Pick a build and settings
 
-- **Emulator build:** v0.30.0 is the default, and every update selects the new build. The dropdown also lists the
-  builds already on your PC, so you can switch back.
+- **Emulator build:** v0.20.1 is the default. Older builds download when you pick them.
 - **Graphics tab:** 1440p windowed is the default. The upscaler is the game's own FSR 2 at Quality (it renders 67%
   of your resolution). DLSS (GeForce RTX cards) and XeSS (most cards) are the other choices. A lower resolution or a
   lower quality is faster. 4K Quality renders 2560×1440 and needs a strong card; Balanced or Performance is lighter.
-- **Frame generation (experimental):** on a GeForce RTX 40 or 50 series card, pick DLSS, then turn on **Frame
-  generation**. About twice as many frames reach the screen; input lag goes up a little. It needs
-  Hardware-accelerated GPU scheduling on in Windows (Settings → Display → Graphics).
 - **Ultrawide or 4:3 screen:** the picture keeps 16:9 with black bars. **Aspect ratio → Stretch** fills the screen
   instead.
 

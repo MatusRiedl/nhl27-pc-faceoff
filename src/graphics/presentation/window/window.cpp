@@ -7,6 +7,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/freezeDump.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -429,12 +430,15 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 
 		case SDL_EVENT_WINDOW_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
+			Common::FreezeDump::SetMinimized(true);
 			break;
 		case SDL_EVENT_WINDOW_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
+			Common::FreezeDump::SetMinimized(false);
 			break;
 		case SDL_EVENT_WINDOW_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			Common::FreezeDump::SetMinimized(false);
 			break;
 		case SDL_EVENT_WINDOW_MOUSE_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);

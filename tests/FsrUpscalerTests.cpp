@@ -68,6 +68,27 @@ int main() {
 			Check(ShouldResetHistory(&prev, bad, false) == R::FrameDiscontinuity, "reset on repeated frame");
 			bad = cur; bad.frame = prev.frame - 5;
 			Check(ShouldResetHistory(&prev, bad, false) == R::FrameDiscontinuity, "reset on backwards frame");
+			{
+				// Upscaler size hold (KYTY_UPSCALER_SIZE_HOLD).
+				using A = Nhl27SizeHold::Action;
+				const Nhl27SizeHold::Size live {1280, 720, 1920, 1080}, odd {2348, 1320, 3520, 1980},
+					odd2 {2000, 1125, 3000, 1688};
+				Nhl27SizeHold off {0};
+				Check(off.Decide(odd, nullptr) == A::Take, "hold off: first build is taken");
+				Check(off.Decide(live, &live) == A::Take, "hold off: same size taken");
+				Check(off.Decide(odd, &live) == A::Rebuild && off.ended == 0, "hold off: new size rebuilds at once");
+				Nhl27SizeHold hold {2};
+				Check(hold.Decide(odd, nullptr) == A::Take, "hold: nothing built yet is taken");
+				Check(hold.Decide(odd, &live) == A::Hold && hold.held == 1, "hold: first odd frame held");
+				Check(hold.Decide(live, &live) == A::Take && hold.ended == 1 && hold.held == 0,
+					"hold: back to the built size ends the hold, no rebuild");
+				Check(hold.Decide(live, &live) == A::Take && hold.ended == 0, "hold: no hold, nothing ended");
+				Check(hold.Decide(odd, &live) == A::Hold && hold.Decide(odd2, &live) == A::Hold,
+					"hold: two different odd sizes count in one row");
+				Check(hold.Decide(odd2, &live) == A::Rebuild && hold.ended == 2 && hold.held == 0,
+					"hold: a size that stays past the limit rebuilds");
+				Check(hold.Decide(odd2, &odd2) == A::Take && hold.ended == 0, "hold: rebuilt size is taken");
+			}
 			bad = cur; bad.output_width += 2;
 			Check(ShouldResetHistory(&prev, bad, false) == R::SizeChange, "reset on output size change");
 			bad = cur; bad.height -= 8;

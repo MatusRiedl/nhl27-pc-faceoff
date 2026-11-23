@@ -58,6 +58,23 @@ namespace {
 	return enabled;
 }
 
+// Upstream KytyPS5 PR #2417: a cached depth image shorter than the depth target the game binds is
+// recreated too, not only a narrower one (the render area follows the request either way).
+// KYTY_DEPTH_GROW_HEIGHT=0 keeps the v0.30.0 width-only rule. Out of line and noexcept, so
+// DepthOverlapNeedsRecreate gains one plain call and no branch: its CFG, and so its PGO profile,
+// stays the same.
+// The replacement takes the requested extent, so a request that is taller but narrower than the
+// cached image keeps the v0.30.0 reuse: recreating it would shrink the width, and the next wider
+// target would recreate it back, every frame.
+[[nodiscard]] [[gnu::noinline]] bool DepthHeightTooShort(const ImageInfo& cached, const ImageInfo& requested) noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEPTH_GROW_HEIGHT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && cached.extent.height < requested.extent.height &&
+	       cached.extent.width <= requested.extent.width;
+}
+
 [[nodiscard]] bool StencilOwnPlane() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_STENCIL_OWN_PLANE");
@@ -307,6 +324,7 @@ static bool ImageChurnLogLine() {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	const Common::HitchWhy::Span span(Common::HitchWhy::Cause::Image);
 	BufferCache::PerfCount(BufferCache::PerfEvent::ImageInsert);
 	if (ImageChurnLogLine()) {
 		std::printf("NHL27IMAGE: insert addr=0x%llx size=0x%llx fmt=%s %ux%ux%u levels=%u layers=%u "
@@ -1132,6 +1150,7 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
 			// The render area follows the request, so a narrower image would be drawn past its edge.
 			recreate |= DepthGrowRecreate() && cached.info.extent.width < requested.extent.width;
+			recreate |= DepthHeightTooShort(cached.info, requested);
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
@@ -1523,6 +1542,7 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	const Common::HitchWhy::Span span(Common::HitchWhy::Cause::Image);
 	BufferCache::PerfCount(BufferCache::PerfEvent::ImageUpload);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;

@@ -2,59 +2,6 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
-## v0.30.0
-
-- 🎞️ **DLSS frame generation (experimental).** On an NVIDIA GeForce RTX 40 or 50 series card, pick DLSS on the
-  Graphics tab and turn on **Frame generation**. NVIDIA DLSS Frame Generation adds a generated frame between each
-  two the game draws, so about twice as many frames reach the screen. It is off by default.
-  - Input lag goes up a little and the HUD can smear in fast moves.
-  - VSync can't be used while it is on (a Vulkan limit): the emulator presents in mailbox mode, or immediate.
-  - It needs Hardware-accelerated GPU scheduling on in Windows (Settings → Display → Graphics) and a current
-    NVIDIA driver.
-  - To place the generated frames, the emulator reads the game's camera from its shader data. That costs a little
-    CPU and runs only while frame generation is on.
-  - If the files are missing or your card or driver can't run it, the game runs without it and the play log says
-    why (`NHL27FG` lines). If the game won't start with it on, turn it off.
-  - The NVIDIA Streamline files it needs ship in the build folder (`sl.*.dll`, `nvngx_dlssg.dll`).
-- ⚡ **Less stutter while shaders compile** (the first start, or after a driver update).
-  - A shader the frame on screen is waiting for is compiled before the backlog of stored ones.
-  - Compute pipelines are built on the compile threads instead of in the middle of a frame.
-  - Graphics pipelines the start-up prebuild had no time for are built in the background, and a draw takes the
-    finished one.
-  - CPUs with more than 8 cores use more compile threads (cores minus 2, up to 10). On 8 cores or fewer it stays 6.
-- 🧵 **Thread pinning follows your CPU.** The GPU threads go on real cores that Windows reports, and E-cores are
-  skipped. On an 8-core / 16-thread CPU nothing changes; 6-core CPUs, Intel hybrid (P+E) CPUs and CPUs without
-  SMT get a better layout.
-- 🔽 **The build picker is a dropdown.** It lists the newest build and the builds on your PC, newest first. A
-  build you don't have shows a **Download** button. Every Faceoff update selects the new build; the old build
-  folders stay, so you can switch back.
-- 💛 **Buy me a coffee and Discord** now sit under the tabs, on every tab.
-- **First start:** a new build compiles its shaders again once, so the first arena load stutters for 30 s or
-  longer. Saves and the shader cache stay.
-- **Known:**
-  - This build was not given a fresh speed profile (PGO), so some frames may run a little slower than v0.20.1.
-    If play feels slower after the update, pick v0.20.1 in the dropdown (it stays there when you updated from
-    v0.20.x) and tell us on Discord.
-  - Frame generation is new. If it misbehaves, turn it off and send the play log.
-- **Updating:** Faceoff 0.20.2 updates itself to 0.30.0 and selects v0.30.0. On v0.20.1 or older, click
-  **Update** once.
-
-## v0.20.2
-
-- 🔄 **Faceoff updates itself.** When a new release is on GitHub, Faceoff downloads it, installs the new emulator
-  build, selects it and restarts, with no click. It checks at every start and every 30 minutes while it's open.
-  - While the game is running it waits, and finishes after you close the game.
-  - If Faceoff is in the background, it restarts when you click back into it, so no window pops up over something
-    else.
-  - A release that only changes Faceoff downloads just Faceoff.exe (about 20 MB), not the whole zip.
-  - **Later** puts the update off until the next start. If an update fails 3 times, Faceoff stops trying on its own
-    and shows the error with an **Update** button.
-  - Saves and the shader cache are kept. Click the version number at the bottom right to check now.
-- **Coming from v0.20.1 or older:** the old Faceoff shows this update when you start it (it asks GitHub at most
-  every 6 hours, so restart it later if it doesn't show yet). Click **Update** once. Every update after this one is
-  automatic.
-- The emulator build is the same as v0.20.1.
-
 ## v0.20.1
 
 - 🛠️ **DLSS no longer closes the game at start on some RTX cards.** Before the game reserved its memory, the DLSS

@@ -15,13 +15,17 @@
 #endif
 
 #include "common/assert.h"
+#include "common/hostStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vramPolicy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -69,7 +73,148 @@ void DestroyRecycledImages(VmaAllocator allocator) {
 	g_recycled_bytes = 0;
 }
 
+std::atomic<bool>     g_memory_priority {false};
+std::atomic<uint64_t> g_image_spills {0};
+
+// Bytes the image needs, without creating it (Vulkan 1.3 vkGetDeviceImageMemoryRequirements); 0 when unknown.
+uint64_t ImageMemoryBytes(VmaAllocator allocator, const VkImageCreateInfo* create) noexcept {
+	const auto query = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceImageMemoryRequirements;
+	if (query == nullptr) {
+		return 0;
+	}
+	VmaAllocatorInfo allocator_info {};
+	vmaGetAllocatorInfo(allocator, &allocator_info);
+	VkDeviceImageMemoryRequirements info {VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+	info.pCreateInfo = create;
+	VkMemoryRequirements2 requirements {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+	query(allocator_info.device, &info, &requirements);
+	return requirements.memoryRequirements.size;
+}
+
+// The last try of an image allocation (CreateImage, after the kept images were freed): video memory as before; if the
+// driver refuses, a memory type outside video memory. Sampling from system memory goes over PCIe and is slower, but
+// the game keeps running instead of exiting (a 6 GB card fills up in a match, docs/notes/low-vram-crash-4050.md).
+// Game buffers already end up there through VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE (streamBuffer.cpp). The image stays
+// where it lands. Noinline and noexcept: CreateImage swaps one call for this one and keeps its PGO profile.
+[[gnu::noinline]] VkResult CreateImageOrSpill(VmaAllocator allocator, const VkImageCreateInfo* create,
+                                              const VmaAllocationCreateInfo* alloc_info, VkImage* image,
+                                              VmaAllocation* allocation) noexcept {
+	const VkResult device_result = vmaCreateImage(allocator, create, alloc_info, image, allocation, nullptr);
+	if (device_result == VK_SUCCESS) {
+		return VK_SUCCESS;
+	}
+	const VkPhysicalDeviceMemoryProperties* properties = nullptr;
+	vmaGetMemoryProperties(allocator, &properties);
+	uint32_t system_types = 0;
+	for (uint32_t type = 0; type < properties->memoryTypeCount; type++) {
+		if ((properties->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+			system_types |= 1u << type;
+		}
+	}
+	VkResult system_result = VK_ERROR_FEATURE_NOT_PRESENT;
+	if (system_types != 0) {
+		VmaAllocationCreateInfo system_info {};
+		system_info.memoryTypeBits = system_types;
+		*image                     = VK_NULL_HANDLE;
+		*allocation                = nullptr;
+		system_result              = vmaCreateImage(allocator, create, &system_info, image, allocation, nullptr);
+	}
+	const uint64_t bytes = ImageMemoryBytes(allocator, create);
+	const double   mb    = static_cast<double>(bytes) / (1024.0 * 1024.0);
+	if (system_result == VK_SUCCESS) {
+		const uint64_t count = g_image_spills.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((count & (count - 1)) == 0) { // the 1st, 2nd, 4th, 8th... spill
+			std::printf("NHL27VRAM: image %ux%ux%u format=%d layers=%u levels=%u (%.1f MB) placed in system memory, "
+			            "video memory full (%s) n=%llu\n",
+			            create->extent.width, create->extent.height, create->extent.depth,
+			            static_cast<int>(create->format), create->arrayLayers, create->mipLevels, mb,
+			            vk::to_string(static_cast<vk::Result>(device_result)).c_str(),
+			            static_cast<unsigned long long>(count));
+			std::fflush(stdout);
+		}
+		return VK_SUCCESS;
+	}
+	std::printf("NHL27VRAM: image %ux%ux%u format=%d layers=%u levels=%u (%.1f MB) refused: video memory %s, system "
+	            "memory %s\n",
+	            create->extent.width, create->extent.height, create->extent.depth, static_cast<int>(create->format),
+	            create->arrayLayers, create->mipLevels, mb,
+	            vk::to_string(static_cast<vk::Result>(device_result)).c_str(),
+	            vk::to_string(static_cast<vk::Result>(system_result)).c_str());
+	Common::PrintOutOfCommit("Vulkan image", bytes);
+	std::fflush(stdout);
+	return device_result;
+}
+
+// KYTY_DBG_VRAM_RESERVE_MB=N (tests only, vramPolicy.h): hold N MB of video memory for the whole run, in 512 MiB
+// blocks at the highest priority (when memory priority is on), so a 16 GB card behaves like a smaller one. The blocks
+// are never freed; process exit returns them.
+[[gnu::noinline]] void ReserveDebugVram(VkDevice device, const vk::PhysicalDeviceMemoryProperties& properties) noexcept {
+	const char* env = std::getenv("KYTY_DBG_VRAM_RESERVE_MB");
+	const long long reserve_mb = env != nullptr ? std::atoll(env) : 0;
+	if (reserve_mb <= 0) {
+		return;
+	}
+	uint32_t type_index = UINT32_MAX;
+	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+		const auto flags = static_cast<VkMemoryPropertyFlags>(properties.memoryTypes[type].propertyFlags);
+		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+			type_index = type;
+			break;
+		}
+	}
+	if (type_index == UINT32_MAX) {
+		std::printf("NHL27VRAM: debug reserve skipped, no video-memory type\n");
+		return;
+	}
+	constexpr uint64_t Block    = 512ull * 1024 * 1024;
+	const uint64_t     wanted   = static_cast<uint64_t>(reserve_mb) * 1024 * 1024;
+	const bool         priority = Vram::PriorityEnabled();
+	uint64_t           held     = 0;
+	uint32_t           blocks   = 0;
+	VkResult           result   = VK_SUCCESS;
+	while (held < wanted) {
+		VkMemoryPriorityAllocateInfoEXT priority_info {VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT};
+		priority_info.priority = 1.0f;
+		VkMemoryAllocateInfo info {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		info.pNext           = priority ? &priority_info : nullptr;
+		info.allocationSize  = std::min(Block, wanted - held);
+		info.memoryTypeIndex = type_index;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		result = VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(device, &info, nullptr, &memory);
+		if (result != VK_SUCCESS) {
+			break;
+		}
+		held += info.allocationSize;
+		blocks++;
+	}
+	std::printf("NHL27VRAM: debug reserve %llu of %lld MB held in %u blocks (priority=%s, type %u)%s%s\n",
+	            static_cast<unsigned long long>(held >> 20u), reserve_mb, blocks, priority ? "1.0" : "default",
+	            type_index, result == VK_SUCCESS ? "" : ", stopped: ",
+	            result == VK_SUCCESS ? "" : vk::to_string(static_cast<vk::Result>(result)).c_str());
+	std::fflush(stdout);
+}
+
 } // namespace
+
+namespace Vram {
+
+bool PageableWanted() noexcept {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_VRAM_PAGEABLE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return wanted;
+}
+
+void SetPriorityEnabled(bool enabled) noexcept {
+	g_memory_priority.store(enabled, std::memory_order_relaxed);
+}
+
+bool PriorityEnabled() noexcept {
+	return g_memory_priority.load(std::memory_order_relaxed);
+}
+
+} // namespace Vram
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -96,6 +241,7 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	ReserveDebugVram(static_cast<VkDevice>(device), physical_device_memory_properties);
 	return true;
 }
 
@@ -131,6 +277,16 @@ void GraphicContext::LogMemoryBudget() const {
 	// refuses new ones past maxMemoryAllocationCount even with memory free.
 	printf("VMA memory objects: %" PRIu64 " of maxMemoryAllocationCount=%u\n", memory_objects,
 	       physical_device.getProperties().limits.maxMemoryAllocationCount);
+	// Deleted images kept for reuse still hold video memory (counted in heap 0's usage above).
+	size_t   recycled_count = 0;
+	uint64_t recycled_bytes = 0;
+	{
+		std::lock_guard lock(g_recycled_mutex);
+		recycled_count = g_recycled.size();
+		recycled_bytes = g_recycled_bytes;
+	}
+	printf("VMA recycled images: %zu kept, %" PRIu64 " MB; images placed in system memory so far: %" PRIu64 "\n",
+	       recycled_count, recycled_bytes >> 20u, g_image_spills.load(std::memory_order_relaxed));
 }
 
 void GraphicContext::ReleaseRecycledImages() {
@@ -234,11 +390,12 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
 		    &native_image, &image.allocation, nullptr));
 		if (result != vk::Result::eSuccess) {
-			// Memory kept for reuse may be what the new image needs.
+			// Memory kept for reuse may be what the new image needs; if video memory still refuses,
+			// the image goes to system memory (CreateImageOrSpill).
 			DestroyRecycledImages(allocator);
-			result = static_cast<vk::Result>(vmaCreateImage(
+			result = static_cast<vk::Result>(CreateImageOrSpill(
 			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-			    &alloc_info, &native_image, &image.allocation, nullptr));
+			    &alloc_info, &native_image, &image.allocation));
 		}
 		if (result != vk::Result::eSuccess) {
 			image.image = native_image;

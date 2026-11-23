@@ -2,18 +2,29 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "kernel/eventQueue.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/crosscreaseOnline.h"
+
+// CrossCrease online: trace the network and NP functions the game calls.
+#undef PRINT_NAME
+#define PRINT_NAME() CROSSCREASE_PRINT_NAME()
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Libs {
@@ -133,6 +144,13 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
 }
 
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      Net::NetResolverInfo* info, int timeout,
+                                                      int retry, int flags) {
+	return FinishNetCall(
+	    Net::NetResolverStartNtoaMultipleRecords(rid, hostname, info, timeout, retry, flags));
+}
+
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
 	return FinishNetCall(Net::NetInetPton(af, src, dst));
 }
@@ -239,6 +257,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
+	LIB_FUNC("RCCY01Xd+58", LibNet::NetResolverStartNtoaMultipleRecords);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);
@@ -727,6 +746,9 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
 	LIB_FUNC("EY28T2bkN7k", Http::HttpAddRequestHeader);
 	LIB_FUNC("1e2BNwI-XzE", Http::HttpSendRequest);
+	LIB_FUNC("P5pdoykPYTk", Http::HttpReadData);
+	LIB_FUNC("f42K37mm5RM", Http::HttpsEnableOption);
+	LIB_FUNC("U5ExQGyyx9s", Http::HttpsSetSslVersion);
 	LIB_FUNC("hvG6GfBMXg8", Http::HttpAbortRequest);
 	LIB_FUNC("qISjDHrxONc", Http::HttpWaitRequest);
 	LIB_FUNC("0a2TBNfE3BU", Http::HttpGetStatusCode);
@@ -758,6 +780,8 @@ LIB_DEFINE(InitNet_1_Http) {
 namespace LibHttp2 {
 
 LIB_VERSION("Http2", 1, "Http2", 1, 1);
+
+namespace EventQueue = LibKernel::EventQueue;
 
 constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
 constexpr int HTTP2_ERROR_BEFORE_SEND  = -2122641307; /* 0x817B1065 */
@@ -810,6 +834,9 @@ struct Http2Request {
 	int                                              async_result = HTTP2_ERROR_BEFORE_SEND;
 	int                                              async_event  = 0;
 	Http2Options                                     options;
+	// CrossCrease online: request in flight through the CrossCrease HTTP gateway.
+	std::shared_ptr<CrossCreaseOnline::HttpExchange> exchange;
+	std::shared_ptr<std::atomic<bool>>               exchange_done;
 };
 
 struct Http2AsyncResult {
@@ -819,6 +846,16 @@ struct Http2AsyncResult {
 	uint8_t padding[4];
 	void*   reserved;
 };
+
+struct Http2TriggerUserEventArgs {
+	EventQueue::KernelEqueue eq;
+	int                      uniq_id;
+	uint8_t                  padding[4];
+	void*                    udata;
+	void*                    reserved;
+};
+
+static_assert(sizeof(Http2TriggerUserEventArgs) == 32);
 
 static int g_http2_next_context_id  = 1;
 static int g_http2_next_template_id = 1;
@@ -1206,6 +1243,65 @@ static int KYTY_SYSV_ABI Http2SetRecvTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
+// CrossCrease online: Http2 requests for mapped hosts go to the CrossCrease HTTP gateway (see
+// crosscreaseOnline.h). Returns false when the request is not routed (old offline behaviour).
+static bool Http2StartExchange(Http2Request* request, const void* post_data, size_t size,
+                               std::function<void()> on_done) {
+	const auto route = CrossCreaseOnline::HttpRouteFor(request->url);
+	if (route == CrossCreaseOnline::HttpRoute::Blocked) {
+		request->send_result = HTTP2_ERROR_TIMEOUT;
+		return false;
+	}
+	if (route != CrossCreaseOnline::HttpRoute::Gateway) {
+		return false;
+	}
+	auto exchange    = std::make_shared<CrossCreaseOnline::HttpExchange>();
+	exchange->method = request->method;
+	exchange->url    = request->url;
+	exchange->headers = request->headers;
+	auto tmpl         = g_http2_templates.find(request->tmpl_id);
+	if (tmpl != g_http2_templates.end() && !tmpl->second.user_agent.empty()) {
+		exchange->headers.emplace_back("User-Agent", tmpl->second.user_agent);
+	}
+	if (post_data != nullptr && size != 0) {
+		exchange->body.assign(static_cast<const char*>(post_data), size);
+	}
+	auto done               = std::make_shared<std::atomic<bool>>(false);
+	request->exchange       = exchange;
+	request->exchange_done  = done;
+	request->send_result    = HTTP2_ERROR_BEFORE_SEND;
+	std::thread([exchange, done, on_done = std::move(on_done)] {
+		CrossCreaseOnline::HttpPerform(exchange.get());
+		done->store(true, std::memory_order_release);
+		if (on_done) {
+			on_done();
+		}
+	}).detach();
+	return true;
+}
+
+// Moves a finished gateway exchange into the request. `wait` blocks until it finishes.
+static void Http2CollectExchange(Http2Request* request, bool wait) {
+	if (request->exchange == nullptr) {
+		return;
+	}
+	while (wait && !request->exchange_done->load(std::memory_order_acquire)) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	if (!request->exchange_done->load(std::memory_order_acquire)) {
+		return;
+	}
+	auto& x                   = *request->exchange;
+	request->status_code      = x.status;
+	request->response_headers = x.response_headers;
+	request->response_body    = std::move(x.response_body);
+	request->read_offset      = 0;
+	request->send_result =
+	    x.error == CrossCreaseOnline::HttpExchange::Error::None ? 0 : HTTP2_ERROR_TIMEOUT;
+	request->exchange.reset();
+	request->exchange_done.reset();
+}
+
 static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, size_t size) {
 	PRINT_NAME();
 
@@ -1222,13 +1318,27 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	if (Http2StartExchange(&request->second, post_data, size, nullptr)) {
+		Http2CollectExchange(&request->second, true);
+		return request->second.send_result;
+	}
+
 	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
 	return request->second.send_result;
 }
 
+// Async operations complete at once; the caller's event queue gets the completion event.
+static void Http2TriggerUserEvent(const Http2TriggerUserEventArgs* kqueue_option) {
+	if (kqueue_option != nullptr) {
+		EventQueue::KernelTriggerUserEvent(kqueue_option->eq, kqueue_option->uniq_id,
+		                                   kqueue_option->udata);
+	}
+}
+
 static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
-                                               void* /*kqueue_option*/, void* /*option*/) {
+                                               const Http2TriggerUserEventArgs* kqueue_option,
+                                               void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1244,9 +1354,25 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	request->second.async_event = 0;
+	if (!CrossCreaseOnline::Enabled()) { // Faceoff: offline keeps the old answer, no event
+		request->second.send_result  = HTTP2_ERROR_TIMEOUT;
+		request->second.async_result = request->second.send_result;
+		return 0;
+	}
+	if (kqueue_option != nullptr) {
+		const Http2TriggerUserEventArgs event = *kqueue_option;
+		if (Http2StartExchange(&request->second, post_data, size,
+		                       [event] { Http2TriggerUserEvent(&event); })) {
+			return 0;
+		}
+	} else if (Http2StartExchange(&request->second, post_data, size, nullptr)) {
+		return 0;
+	}
+
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
 	request->second.async_result = request->second.send_result;
-	request->second.async_event  = 0;
+	Http2TriggerUserEvent(kqueue_option);
 
 	return 0;
 }
@@ -1265,6 +1391,11 @@ static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, ui
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.exchange != nullptr) {
+		Http2CollectExchange(&request->second, true);
+		request->second.async_result = request->second.send_result;
 	}
 
 	*result            = {};
@@ -1291,6 +1422,8 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
+
+	Http2CollectExchange(&request->second, true);
 
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
@@ -1320,6 +1453,8 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
+
+	Http2CollectExchange(&request->second, true);
 
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
@@ -1351,6 +1486,8 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	Http2CollectExchange(&request->second, true);
+
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1377,6 +1514,8 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	Http2CollectExchange(&request->second, true);
+
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1396,7 +1535,8 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 }
 
 static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
-                                            void* /*kqueue_option*/, void* /*option*/) {
+                                            const Http2TriggerUserEventArgs* kqueue_option,
+                                            void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1412,25 +1552,29 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	Http2CollectExchange(&request->second, true);
+
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		request->second.async_result = send_result;
-		request->second.async_event  = 1;
-		return 0;
+	} else {
+		const auto& body      = request->second.response_body;
+		const auto  remaining = request->second.read_offset < body.size()
+		                            ? body.size() - request->second.read_offset
+		                            : 0;
+		const auto  to_copy   = size < remaining ? size : remaining;
+
+		if (to_copy != 0) {
+			std::memcpy(data, body.data() + request->second.read_offset, to_copy);
+			request->second.read_offset += to_copy;
+		}
+
+		request->second.async_result = static_cast<int>(to_copy);
 	}
-
-	const auto& body = request->second.response_body;
-	const auto  remaining =
-	    request->second.read_offset < body.size() ? body.size() - request->second.read_offset : 0;
-	const auto to_copy = size < remaining ? size : remaining;
-
-	if (to_copy != 0) {
-		std::memcpy(data, body.data() + request->second.read_offset, to_copy);
-		request->second.read_offset += to_copy;
+	request->second.async_event = 1;
+	if (CrossCreaseOnline::Enabled()) { // Faceoff: offline posts no event, as before
+		Http2TriggerUserEvent(kqueue_option);
 	}
-
-	request->second.async_result = static_cast<int>(to_copy);
-	request->second.async_event  = 1;
 
 	return 0;
 }
@@ -1639,6 +1783,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("p-o74CnoNzY", NpManager::NpGetNpId);
 	LIB_FUNC("XDncXQIJUSk", NpManager::NpGetOnlineId);
 	LIB_FUNC("rbknaUjpqWo", NpManager::NpGetAccountIdA);
+	LIB_FUNC("VgYczPGB5ss", NpManager::NpGetUserIdByAccountId);
 	LIB_FUNC("JT+t00a3TxA", NpManager::NpGetAccountCountryA);
 	LIB_FUNC("+4DegjBqV1g", NpManager::NpGetAccountAge);
 	LIB_FUNC("3Tcz5bNCfZQ", NpManager::NpGetAccountLanguage2);
@@ -1682,11 +1827,33 @@ LIB_VERSION("NpAuth", 1, "NpAuth", 1, 1);
 constexpr int NP_AUTH_MAX_REQUEST_NUM         = 16;
 constexpr int NP_AUTH_REQUEST_ID_OFFSET       = 0x10000000;
 constexpr int NP_AUTH_ERROR_INVALID_ARGUMENT  = -2141912319; /* 0x80550301 */
+constexpr int NP_AUTH_ERROR_INVALID_SIZE      = -2141912318; /* 0x80550302 */
 constexpr int NP_AUTH_ERROR_ABORTED           = -2141912316; /* 0x80550304 */
 constexpr int NP_AUTH_ERROR_REQUEST_MAX       = -2141912315; /* 0x80550305 */
 constexpr int NP_AUTH_ERROR_REQUEST_NOT_FOUND = -2141912314; /* 0x80550306 */
 constexpr int NP_AUTH_ERROR_INVALID_ID        = -2141912313; /* 0x80550307 */
+constexpr int NP_AUTH_ERROR_SERVICE_DOWN      = -2141912063; /* 0x80550401 */
 constexpr int NP_ERROR_SIGNED_OUT             = -2141913082; /* 0x80550006 */
+
+struct NpAuthGetAuthorizationCodeParameterV3 {
+	size_t      size;
+	int         user_id;
+	uint8_t     padding[4];
+	const void* client_id;
+	const char* scope;
+};
+
+struct NpAuthGetIdTokenParameterV3 {
+	size_t      size;
+	int         user_id;
+	uint8_t     padding[4];
+	const void* client_id;
+	const void* client_secret;
+	const char* scope;
+};
+
+static_assert(sizeof(NpAuthGetAuthorizationCodeParameterV3) == 32);
+static_assert(sizeof(NpAuthGetIdTokenParameterV3) == 40);
 
 enum class NpAuthRequestState {
 	None = 0,
@@ -1819,7 +1986,7 @@ static int np_auth_wait_or_poll_async(int req_id, int* result) {
 	return 0;
 }
 
-static int np_auth_complete_signed_out(NpAuthRequest* request) {
+static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 	if (request->state == NpAuthRequestState::Complete) {
 		request->result = NP_AUTH_ERROR_INVALID_ARGUMENT;
 		return NP_AUTH_ERROR_INVALID_ARGUMENT;
@@ -1830,9 +1997,11 @@ static int np_auth_complete_signed_out(NpAuthRequest* request) {
 	}
 
 	request->state  = NpAuthRequestState::Complete;
-	request->result = NP_ERROR_SIGNED_OUT;
+	// Emulating sign-in cannot provide a real authorization code or ID token.
+	request->result = Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN
+	                                                        : NP_ERROR_SIGNED_OUT;
 
-	return request->async ? 0 : NP_ERROR_SIGNED_OUT;
+	return request->async ? 0 : request->result;
 }
 
 static int KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
@@ -1853,8 +2022,9 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* param,
-                                                      void* auth_code, int* issuer_id) {
+static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
+    int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
+    int* issuer_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1862,9 +2032,32 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 	LOGF("\t auth_code = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(auth_code));
 	LOGF("\t issuer_id = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(issuer_id));
 
-	if (auth_code != nullptr) {
-		memset(auth_code, 0, 136);
+	if (!CrossCreaseOnline::Enabled()) { // Faceoff: offline keeps the old answer (signed out)
+		if (auth_code != nullptr) {
+			memset(auth_code, 0, 136);
+		}
+		if (issuer_id != nullptr) {
+			*issuer_id = 0;
+		}
+		std::scoped_lock lock(g_np_auth_request_mutex);
+		auto*            request = np_auth_find_request(req_id);
+		if (request == nullptr) {
+			return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+		}
+		return np_auth_complete_unavailable(request, 0);
 	}
+
+	if (req_id <= 0 || param == nullptr || auth_code == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+	if (param->size < sizeof(*param)) {
+		return NP_AUTH_ERROR_INVALID_SIZE;
+	}
+	if (param->client_id == nullptr || param->scope == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(auth_code, 0, 136);
 	if (issuer_id != nullptr) {
 		*issuer_id = 0;
 	}
@@ -1874,46 +2067,56 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 	if (request == nullptr) {
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
-	if (request->state == NpAuthRequestState::Aborted) {
-		// request->result = 0;
-		// return 0;
-		request->result = NP_AUTH_ERROR_ABORTED;
-		return NP_AUTH_ERROR_ABORTED;
+	// CrossCrease online: the configured server sign-in token stands in for the PSN code.
+	if (request->state == NpAuthRequestState::Ready &&
+	    Network::NpManager::IsSignedIn(param->user_id) &&
+	    CrossCreaseOnline::AuthorizationCode(param->scope, static_cast<char*>(auth_code), 129,
+	                                         issuer_id)) {
+		request->state  = NpAuthRequestState::Complete;
+		request->result = 0;
+		return 0;
 	}
-	// request->state  = NpAuthRequestState::Complete;
-	// request->result = 0;
-
-	// return 0;
-	return np_auth_complete_signed_out(request);
+	return np_auth_complete_unavailable(request, param->user_id);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void* id_token) {
+static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
+                                        void* id_token) {
 	PRINT_NAME();
 
 	LOGF("\t req_id   = %d\n", req_id);
 	LOGF("\t param    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 	LOGF("\t id_token = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(id_token));
 
-	if (id_token != nullptr) {
-		memset(id_token, 0, 4104);
+	if (!CrossCreaseOnline::Enabled()) { // Faceoff: offline keeps the old answer (signed out)
+		if (id_token != nullptr) {
+			memset(id_token, 0, 4104);
+		}
+		std::scoped_lock lock(g_np_auth_request_mutex);
+		auto*            request = np_auth_find_request(req_id);
+		if (request == nullptr) {
+			return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+		}
+		return np_auth_complete_unavailable(request, 0);
 	}
+
+	if (req_id <= 0 || param == nullptr || id_token == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+	if (param->size < sizeof(*param)) {
+		return NP_AUTH_ERROR_INVALID_SIZE;
+	}
+	if (param->client_id == nullptr || param->client_secret == nullptr || param->scope == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(id_token, 0, 4104);
 
 	std::scoped_lock lock(g_np_auth_request_mutex);
 	auto*            request = np_auth_find_request(req_id);
 	if (request == nullptr) {
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
-	if (request->state == NpAuthRequestState::Aborted) {
-		// request->result = 0;
-		// return 0;
-		request->result = NP_AUTH_ERROR_ABORTED;
-		return NP_AUTH_ERROR_ABORTED;
-	}
-	// request->state  = NpAuthRequestState::Complete;
-	// request->result = 0;
-
-	// return 0;
-	return np_auth_complete_signed_out(request);
+	return np_auth_complete_unavailable(request, param->user_id);
 }
 
 LIB_DEFINE(InitNet_1_NpAuth) {
@@ -2144,6 +2347,8 @@ static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char*
 		request.path                     = (path != nullptr ? path : "");
 		request.method                   = (method != nullptr ? method : "");
 		NpWebApi2Requests()[*request_id] = request;
+		CrossCreaseOnline::Trace("webapi2 create %s %s%s", request.method.c_str(),
+		                         request.api_group.c_str(), request.path.c_str());
 	}
 
 	return 0;
@@ -2177,6 +2382,33 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 
 	request->second.response.clear();
 	request->second.read_offset = 0;
+
+	// CrossCrease online: answer PSN WebAPI calls from the CrossCrease server's HTTP gateway.
+	if (CrossCreaseOnline::HttpGatewayConfigured()) {
+		CrossCreaseOnline::HttpExchange exchange;
+		exchange.method = request->second.method.empty() ? "GET" : request->second.method;
+		exchange.url    = "https://" + request->second.api_group + ".np.webapi.playstation.net" +
+		               (request->second.path.empty() || request->second.path[0] != '/' ? "/" : "") +
+		               request->second.path;
+		exchange.headers.emplace_back("X-CrossCrease-Api", "NpWebApi2");
+		if (data != nullptr && data_size != 0) {
+			exchange.body.assign(static_cast<const char*>(data), data_size);
+			exchange.headers.emplace_back("Content-Type", "application/json");
+		}
+		CrossCreaseOnline::HttpPerform(&exchange);
+		if (exchange.error == CrossCreaseOnline::HttpExchange::Error::None) {
+			request->second.response = std::move(exchange.response_body);
+			if (response_info_option != nullptr) {
+				response_info_option->http_status        = exchange.status;
+				response_info_option->response_data_size = request->second.response.size();
+				if (response_info_option->error_object != nullptr &&
+				    response_info_option->error_object_size > 0) {
+					response_info_option->error_object[0] = '\0';
+				}
+			}
+			return 0;
+		}
+	}
 
 	if (response_info_option != nullptr) {
 		response_info_option->http_status        = 0;
@@ -2344,6 +2576,25 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	return callback_id++;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filter_id) {
+	PRINT_NAME();
+
+	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
+	LOGF("\t filter_id  = %d\n", filter_id);
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
+                                                              int callback_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_context_id = %d\n", user_context_id);
+	LOGF("\t callback_id     = %d\n", callback_id);
+
+	return 0;
+}
+
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
 	// Timeout processing is an internal maintenance tick in Prospero. Requests
 	// complete synchronously in this implementation, so there is no pending
@@ -2380,6 +2631,8 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("QafxeZM3WK4", LibNpWebApi2::NpWebApi2PushEventDeletePushContext);
 	LIB_FUNC("MsaFhR+lPE4", LibNpWebApi2::NpWebApi2PushEventCreateFilter);
 	LIB_FUNC("fY3QqeNkF8k", LibNpWebApi2::NpWebApi2PushEventRegisterCallback);
+	LIB_FUNC("KJdPcOGmK58", LibNpWebApi2::NpWebApi2PushEventDeleteFilter);
+	LIB_FUNC("hOnIlcGrO6g", LibNpWebApi2::NpWebApi2PushEventUnregisterCallback);
 	LIB_FUNC("3Tt9zL3tkoc", LibNpWebApi2::NpWebApi2CheckTimeout);
 	LIB_FUNC("bEvXpcEk200", LibNpWebApi2::NpWebApi2Terminate);
 }

@@ -50,6 +50,7 @@ enum class Cause : uint8_t {
 	Urgent,      // The draw thread runs commands other threads wait for.
 	Meta,        // Readback of GPU-written color metadata.
 	Io,          // Guest file reads.
+	Image,       // Texture-cache image creation and upload recording (TextureCache::InsertImage, UploadImage).
 	Count
 };
 
@@ -68,6 +69,25 @@ enum class Role : uint8_t { Other, Draw, Cp, Present, Prio, Flip, Resolve, Count
 	}();
 	return on;
 }
+
+// KYTY_HITCH_CPU=1 (default off, read once; for the measuring runs): the on-CPU time of the draw and
+// command threads, d_cpu= / c_cpu= in NHL27HITCHWHY and NHL27WHYSUM. It separates a slow frame's
+// draw-thread time that was work from time the thread was off the CPU (preempted, or blocked in the
+// kernel, e.g. in a driver call or a hard page fault). From QueryThreadCycleTime; cycles become ms
+// by the two threads' own GetThreadTimes since first seen (cyc_per_us= in NHL27WHYSUM), not by an
+// assumed clock. Printed once the two threads have used 1 s of CPU. Windows only; in threads.cpp.
+[[nodiscard]] inline bool CpuEnabled() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_HITCH_CPU");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+// The draw or the command thread, once, right after SetRole. Nothing while the switch is off.
+void CpuRegisterCurrent(Role role) noexcept;
+// From Frame() only: on-CPU ms of the draw and the command thread since the previous call (cp_ms < 0:
+// no command thread), and the calibration. False while not registered or not yet calibrated.
+bool CpuTake(double* draw_ms, double* cp_ms, double* cycles_per_us) noexcept;
 
 [[nodiscard]] inline uint64_t NowNs() noexcept {
 	return static_cast<uint64_t>(
@@ -144,7 +164,7 @@ inline void RaiseMax(std::atomic<uint64_t>& max, uint64_t value) noexcept {
 inline void AppendCauses(char* text, size_t size, size_t& used, const Line (&lines)[Roles][Causes], double least) noexcept {
 	static constexpr const char* role_names[Roles]   = {"g_", "d_", "c_", "p_", "q_", "f_", "r_"};
 	static constexpr const char* cause_names[Causes] = {"wait",    "fault", "read",   "unmap", "pipe",
-	                                                     "compile", "cwait", "urgent", "meta",  "io"};
+	                                                     "compile", "cwait", "urgent", "meta",  "io", "image"};
 	for (int r = 0; r < Roles; r++) {
 		for (int c = 0; c < Causes; c++) {
 			const auto& line = lines[r][c];
@@ -333,8 +353,9 @@ inline void Frame(double t_s, double dt_ms) noexcept {
 		Line     lines[Detail::Roles][Detail::Causes];
 		double   idle[Detail::Roles];
 		double   slot, dt, start_s;
+		double   cpu_draw, cpu_cp, cycles_per_us;
 		uint64_t start_ns;
-		int      frames, slow;
+		int      frames, slow, cpu_frames;
 		bool     open;
 	};
 	static Seen     seen[Detail::Roles][Detail::Causes] {};
@@ -390,6 +411,16 @@ inline void Frame(double t_s, double dt_ms) noexcept {
 	window.dt += dt_ms;
 	window.frames++;
 	window.slow += slow ? 1 : 0;
+	double     cpu_draw = 0.0;
+	double     cpu_cp   = -1.0;
+	double     cyc_us   = 0.0;
+	const bool cpu      = CpuEnabled() && CpuTake(&cpu_draw, &cpu_cp, &cyc_us);
+	if (cpu) {
+		window.cpu_draw += cpu_draw;
+		window.cpu_cp += cpu_cp;
+		window.cycles_per_us = cyc_us;
+		window.cpu_frames++;
+	}
 	char   text[4096];
 	size_t used = 0;
 	if (slow) {
@@ -406,6 +437,12 @@ inline void Frame(double t_s, double dt_ms) noexcept {
 		}
 		Detail::Append(text, sizeof(text), used, " flip=%.1f d_idle=%.1f c_idle=%.1f d_slot=%.1f d_rest=%.1f", ms(flip_gap), draw_idle, cp_idle,
 		               slot_ms, rest > 0.0 ? rest : 0.0);
+		if (cpu) {
+			Detail::Append(text, sizeof(text), used, " d_cpu=%.1f", cpu_draw);
+			if (cpu_cp >= 0.0) {
+				Detail::Append(text, sizeof(text), used, " c_cpu=%.1f", cpu_cp);
+			}
+		}
 		Detail::AppendCauses(text, sizeof(text), used, lines, 0.1);
 		Detail::Print(text, sizeof(text), used);
 	}
@@ -424,6 +461,14 @@ inline void Frame(double t_s, double dt_ms) noexcept {
 		               "c_rest=%.0f",
 		               t_s, t_s - window.start_s, window.frames, window.slow, rate, changed >= window.start_ns ? 1 : 0, window.dt,
 		               window.idle[draw], window.slot, draw_rest > 0.0 ? draw_rest : 0.0, window.idle[cp], cp_rest > 0.0 ? cp_rest : 0.0);
+		// Only a window measured in full: a partial sum would read as time off the CPU.
+		if (window.cpu_frames == window.frames) {
+			Detail::Append(text, sizeof(text), used, " d_cpu=%.0f", window.cpu_draw);
+			if (window.cpu_cp >= 0.0) {
+				Detail::Append(text, sizeof(text), used, " c_cpu=%.0f", window.cpu_cp);
+			}
+			Detail::Append(text, sizeof(text), used, " cyc_per_us=%.0f", window.cycles_per_us);
+		}
 		Detail::AppendCauses(text, sizeof(text), used, window.lines, 1.0);
 		Detail::Print(text, sizeof(text), used);
 		window.open = false;

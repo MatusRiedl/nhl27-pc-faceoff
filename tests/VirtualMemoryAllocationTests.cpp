@@ -65,6 +65,7 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 namespace Libs::LibKernel::Memory {
 bool TestWindowsBackingViewModes();
+bool TestWindowsBackingLazyCommit();
 }
 #endif
 
@@ -1876,6 +1877,13 @@ void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
 	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
 	      "backing view permissions differ from the requested mode");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestWindowsBackingLazyCommitRanges() {
+	const char* test = "WindowsBackingLazyCommit";
+	Check(test, Libs::LibKernel::Memory::TestWindowsBackingLazyCommit(),
+	      "lazy backing commit, zero or map through the alias failed");
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -5051,6 +5059,7 @@ int main(int argc, char** argv) {
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);
+	RunTest(TestWindowsBackingLazyCommitRanges);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);

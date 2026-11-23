@@ -519,16 +519,29 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+// Sleeps longer than one signal-poll step end at one deadline (upstream KytyPS5 c13c2ca9): each step
+// sleeps what is left by the clock, so a step's overshoot is not added again. A sleep of one step or
+// less is a single step, as before.
+static uint64_t SteadyNanosSince(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
 
-	while (microseconds > 0) {
-		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
-		microseconds -= step;
+	if (microseconds <= SIGNAL_APC_POLL_MICROS) {
+		Common::Thread::SleepMicro(static_cast<uint32_t>(microseconds));
+		KernelDispatchPendingSignalForCurrentThread();
+		return;
+	}
+
+	const auto start = std::chrono::steady_clock::now();
+	for (uint64_t slept = 0; slept < microseconds; slept = SteadyNanosSince(start) / 1000u) {
+		Common::Thread::SleepMicro(static_cast<uint32_t>(std::min<uint64_t>(microseconds - slept, SIGNAL_APC_POLL_MICROS)));
 		KernelDispatchPendingSignalForCurrentThread();
 	}
 }
@@ -540,10 +553,15 @@ static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	}
 
 	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
-	while (nanoseconds > 0) {
-		const auto step = std::min<uint64_t>(nanoseconds, poll_nanos);
-		Common::Thread::SleepNano(step);
-		nanoseconds -= step;
+	if (nanoseconds <= poll_nanos) {
+		Common::Thread::SleepNano(nanoseconds);
+		KernelDispatchPendingSignalForCurrentThread();
+		return;
+	}
+
+	const auto start = std::chrono::steady_clock::now();
+	for (uint64_t slept = 0; slept < nanoseconds; slept = SteadyNanosSince(start)) {
+		Common::Thread::SleepNano(std::min(nanoseconds - slept, poll_nanos));
 		KernelDispatchPendingSignalForCurrentThread();
 	}
 }

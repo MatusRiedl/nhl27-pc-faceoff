@@ -83,8 +83,20 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// KYTY_GUEST_LAZY_COMMIT (default 1, read once): the section only reserves; CommitRange charges
+		// commit for a backing range before its first map or zero. 0 = commit all of it at start (as before).
+		m_lazy = LazyCommitSwitch();
+		// KYTY_GUEST_LAZY_PREFAULT (default 1, read once): ZeroRange still writes a range it committed just
+		// now, so its pages become resident at zero time (as with the up-front commit), not at first touch.
+		m_prefault = m_lazy && LazyPrefaultSwitch();
+		if (m_lazy) {
+			m_commit_bits.assign(static_cast<size_t>(((m_size + kCommitChunk - 1) / kCommitChunk + 63u) / 64u), 0);
+		}
+		std::printf("NHL27GUESTMEM backing lazy_commit=%d prefault=%d size_mb=%llu\n", m_lazy ? 1 : 0,
+		            m_prefault ? 1 : 0, static_cast<unsigned long long>(m_size >> 20u));
+		std::fflush(stdout);
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | (m_lazy ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -204,6 +216,14 @@ public:
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
+		}
+		bool fresh = false;
+		if (!CommitRange(backing_offset, size, &fresh)) {
+			return false;
+		}
+		if (fresh && !m_prefault) {
+			// Pages committed just now read as zero; a memset would only make them resident.
+			return true;
 		}
 		std::lock_guard lock(m_mutex);
 		std::memset(m_backing_base + backing_offset, 0, size);
@@ -660,6 +680,82 @@ public:
 	}
 
 private:
+	// Commit granularity of the lazy backing: views start on 64 KiB file offsets.
+	static constexpr uint64_t kCommitChunk = 0x10000;
+
+	static bool LazyCommitSwitch() {
+		const char* value = std::getenv("KYTY_GUEST_LAZY_COMMIT");
+		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+	}
+
+	static bool LazyPrefaultSwitch() {
+		const char* value = std::getenv("KYTY_GUEST_LAZY_PREFAULT");
+		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+	}
+
+	// Charges commit for [offset, offset + size) once (64 KiB chunks, never released: section pages cannot be
+	// decommitted). *fresh = every chunk of the range was committed by this call (so it reads as zero).
+	bool CommitRange(uint64_t offset, uint64_t size, bool* fresh) {
+		if (fresh != nullptr) {
+			*fresh = false;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!m_lazy || size == 0) {
+			return true;
+		}
+		const uint64_t first = offset / kCommitChunk;
+		const uint64_t last  = (offset + size - 1) / kCommitChunk;
+		const auto     bit   = [this](uint64_t c) { return (m_commit_bits[c / 64u] >> (c % 64u)) & 1u; };
+		std::lock_guard lock(m_commit_mutex);
+		bool all_new = true;
+		for (uint64_t c = first; c <= last;) {
+			if (bit(c) != 0) {
+				all_new = false;
+				c++;
+				continue;
+			}
+			uint64_t end = c;
+			while (end + 1 <= last && bit(end + 1) == 0) {
+				end++;
+			}
+			const uint64_t start_byte = c * kCommitChunk;
+			const uint64_t bytes      = std::min((end + 1) * kCommitChunk, m_size) - start_byte;
+			if (VirtualAlloc(m_backing_base + start_byte, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+				const auto error = static_cast<uint32_t>(GetLastError());
+				std::printf("NHL27GUESTMEM lazy_commit_failed offset_mb=%llu size_mb=%llu error=0x%08x "
+				            "committed_mb=%llu\n",
+				            static_cast<unsigned long long>(start_byte >> 20u),
+				            static_cast<unsigned long long>(bytes >> 20u), error,
+				            static_cast<unsigned long long>(m_committed >> 20u));
+				std::fflush(stdout);
+				Common::PrintOutOfCommit("guest direct memory (lazy commit)", bytes);
+				return false;
+			}
+			for (uint64_t k = c; k <= end; k++) {
+				m_commit_bits[k / 64u] |= uint64_t {1} << (k % 64u);
+			}
+			const uint64_t before = m_committed;
+			m_committed += bytes;
+			// One line per 512 MiB step of committed backing.
+			if ((m_committed >> 29u) != (before >> 29u)) {
+				std::printf("NHL27GUESTMEM lazy_committed_mb=%llu of=%llu\n",
+				            static_cast<unsigned long long>(m_committed >> 20u),
+				            static_cast<unsigned long long>(m_size >> 20u));
+				std::fflush(stdout);
+			}
+			c = end + 1;
+		}
+		if (fresh != nullptr) {
+			*fresh = all_new;
+		}
+		return true;
+#else
+		(void)offset;
+		(void)size;
+		return true;
+#endif
+	}
+
 	struct ReadCache {
 		// No member initializers: a thread_local static is zero-initialized.
 		const void* owner;
@@ -893,6 +989,10 @@ private:
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
+		if (!CommitRange(backing_offset, size, nullptr)) {
+			SetFailure(failure_reason, FailureReason::BackingUnavailable);
+			return nullptr;
+		}
 		void* ptr =
 		    MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr),
 		                   backing_offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
@@ -916,7 +1016,12 @@ private:
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
-	HANDLE m_handle = nullptr;
+	HANDLE                m_handle = nullptr;
+	bool                  m_lazy   = false;
+	bool                  m_prefault = false;
+	std::mutex            m_commit_mutex;
+	std::vector<uint64_t> m_commit_bits;
+	uint64_t              m_committed = 0;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 
@@ -1013,8 +1118,10 @@ public:
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
-			     "this up front, so the paging file is usually what needs to be larger.\n",
+			Common::PrintOutOfCommit("guest direct memory", backing_size);
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. With\n"
+			     "KYTY_GUEST_LAZY_COMMIT=0 Windows commits this up front, so the paging file is\n"
+			     "usually what needs to be larger.\n",
 			     backing_size / (1024U * 1024U));
 #else
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",

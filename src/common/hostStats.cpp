@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <unordered_map>
 
@@ -575,6 +577,77 @@ HostStats HostStatsSampler::Sample() {
 	m_impl->last     = std::move(now);
 	m_impl->has_last = true;
 	return stats;
+}
+
+CommitCharge GetCommitCharge() noexcept {
+	CommitCharge charge;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PERFORMANCE_INFORMATION performance {};
+	performance.cb = sizeof(performance);
+	if (K32GetPerformanceInfo(&performance, sizeof(performance)) != 0) {
+		charge.system_used  = static_cast<uint64_t>(performance.CommitTotal) * performance.PageSize;
+		charge.system_limit = static_cast<uint64_t>(performance.CommitLimit) * performance.PageSize;
+	}
+	PROCESS_MEMORY_COUNTERS_EX memory {};
+	memory.cb = sizeof(memory);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+	                            sizeof(memory)) != 0) {
+		charge.process = memory.PrivateUsage;
+	}
+#endif
+	return charge;
+}
+
+void PrintOutOfCommit(const char* where, uint64_t requested_bytes) noexcept {
+	constexpr uint64_t mb     = 1024ull * 1024ull;
+	const auto         charge = GetCommitCharge();
+	std::printf("NHL27OOM: %s requested=%llu MB commit=%llu/%llu MB process=%llu MB. Windows ran out of memory "
+	            "(commit): close programs or let Windows manage the paging file\n",
+	            where != nullptr ? where : "?", static_cast<unsigned long long>(requested_bytes / mb),
+	            static_cast<unsigned long long>(charge.system_used / mb),
+	            static_cast<unsigned long long>(charge.system_limit / mb),
+	            static_cast<unsigned long long>(charge.process / mb));
+	std::fflush(stdout);
+}
+
+void OptOutOfPowerThrottling() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const char* value = std::getenv("KYTY_POWER_THROTTLING_OPTOUT"); value != nullptr && value[0] == '0') {
+		std::printf("NHL27POWER: throttling opt-out off (KYTY_POWER_THROTTLING_OPTOUT=0)\n");
+		return;
+	}
+	// SetProcessInformation(ProcessPowerThrottling): Windows may run a process with no focused or
+	// visible window at EcoQoS (efficiency cores, lower clocks) and ignore its timer resolution.
+	// Looked up at run time so the build does not depend on the SDK's _WIN32_WINNT.
+	struct PowerThrottlingState {
+		ULONG version;
+		ULONG control_mask;
+		ULONG state_mask;
+	};
+	using SetProcessInformationFn          = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+	constexpr int   process_power_throttling = 4;   // PROCESS_INFORMATION_CLASS::ProcessPowerThrottling
+	constexpr ULONG execution_speed          = 0x1; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+	constexpr ULONG ignore_timer_resolution  = 0x4; // PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+	const HMODULE   kernel                   = GetModuleHandleA("kernel32.dll");
+	const auto      set_information          = kernel == nullptr
+	                                               ? nullptr
+	                                               : reinterpret_cast<SetProcessInformationFn>(reinterpret_cast<void*>(
+	                                                     GetProcAddress(kernel, "SetProcessInformation")));
+	if (set_information == nullptr) {
+		std::printf("NHL27POWER: throttling opt-out unavailable\n");
+		return;
+	}
+	// Control bits set, state bits clear: never throttle. Older Windows 10 rejects the timer bit,
+	// so retry with execution speed alone.
+	PowerThrottlingState state {1, execution_speed | ignore_timer_resolution, 0};
+	BOOL                 ok = set_information(GetCurrentProcess(), process_power_throttling, &state, sizeof(state));
+	if (ok == FALSE) {
+		state = {1, execution_speed, 0};
+		ok    = set_information(GetCurrentProcess(), process_power_throttling, &state, sizeof(state));
+	}
+	std::printf("NHL27POWER: throttling opt-out ok=%d mask=0x%lx error=%lu\n", ok != FALSE ? 1 : 0,
+	            state.control_mask, ok != FALSE ? 0ul : GetLastError());
+#endif
 }
 
 } // namespace Common

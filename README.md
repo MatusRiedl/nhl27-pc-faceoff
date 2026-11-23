@@ -9,10 +9,8 @@
 &nbsp;·&nbsp; [Quick start](QUICKSTART.md) &nbsp;·&nbsp; [What's new](CHANGELOG.md)
 
 [![Join the Puck Peak Discord](https://img.shields.io/badge/Discord-Join_Puck_Peak-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://gg.puckpeak.com)
-[![Buy me a coffee](https://img.shields.io/badge/Ko--fi-Buy_me_a_coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/iksperial)
 
-Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**<br>
-Support the development, updates and maintenance: **[Buy me a coffee](https://ko-fi.com/iksperial)** ☕
+Questions, news and help: **[gg.puckpeak.com](https://gg.puckpeak.com)**
 
 <img src="docs/shot_play.png" width="720" alt="The Faceoff launcher, ready to play NHL 27">
 
@@ -25,15 +23,13 @@ Support the development, updates and maintenance: **[Buy me a coffee](https://ko
 - ⚡ **A tuned emulator.** NHL 27 runs on our build of [duy64/KytyPS5-nhl](https://github.com/duy64/KytyPS5-nhl), a
   KytyPS5 fork: the game's own frame pacing (30 fps menus, 60 fps play), PGO and AVX2 builds, and fixes for Be a Pro
   crashes and broken images. v0.10 added smoother play (batched memory faults, locks that stop burning the CPU);
-  v0.20 added a retrained speed profile, lazy shared writes at every frame rate and pipelines built at start-up;
-  v0.30 compiles the shaders on screen first and builds pipelines in the background.
-- 🔀 **Pick your build.** A dropdown on the Play tab lists the newest build and the builds on your PC. Every update
-  selects the new build; older ones stay so you can switch back. Downloads are checked against their SHA-256.
+  v0.20 adds a retrained speed profile, lazy shared writes at every frame rate and pipelines built at start-up.
+- 🔀 **Pick your build.** v0.20.1, v0.20.0, v0.10.1, v0.10.0, RC5, RC4 or RC3 on the Play tab. A build you don't have downloads when you pick it
+  and is checked against its SHA-256.
 - 🎛 **Graphics tab.** Resolution (720p to 4K; the game renders a share of it, so lower is faster), windowed or
   fullscreen, Keep 16:9 or Stretch on an ultrawide or 4:3 screen, the upscaler (the game's own FSR 2, NVIDIA DLSS or
-  Intel XeSS) with quality presets, DLSS frame generation (experimental, RTX 40/50), sharpening, and an Advanced
-  section. Trophy pop-ups on the Play tab.
-- 🔄 **Updates itself.** Faceoff checks for a new release at every start and every 30 minutes, then installs it and restarts by itself.
+  Intel XeSS) with quality presets, sharpening, and an Advanced section. Trophy pop-ups on the Play tab.
+- 🔄 **Updates itself.** Faceoff checks for a new release when it starts and installs it in one click.
 - 🔒 **Your saves stay put.** Saves, trophies and the shader cache live next to `Faceoff.exe`, shared by every build.
   Updates never touch them.
 - 🧾 **Crash reports one click away.** After a crash Faceoff shows the play log, jumps to the error and copies it for
@@ -47,7 +43,7 @@ Support the development, updates and maintenance: **[Buy me a coffee](https://ko
 
 ## 🚀 Get started
 
-1. Download `Faceoff-v0.30.0.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
+1. Download `Faceoff-v0.20.0.zip` from the [release page](../../releases/latest) and extract it anywhere you can write
    to (not inside `Program Files`, at least 2 GB free).
 2. Start `Faceoff.exe`. Windows SmartScreen warns because the exe is not signed: choose **More info**, then
    **Run anyway**.
@@ -67,8 +63,6 @@ Step by step, with controls and troubleshooting: [QUICKSTART.md](QUICKSTART.md).
 - About 14 GB of free RAM and 10 GB of video memory at 1440p. Windows also needs room to commit 24-28 GB for the
   emulator in a match (RAM plus pagefile), so keep the pagefile system-managed and close other large apps.
 - The latest Microsoft Visual C++ Redistributable (x64) and a current GPU driver.
-- For frame generation (experimental): a GeForce RTX 40 or 50 series card and Hardware-accelerated GPU scheduling
-  on in Windows (Settings → Display → Graphics).
 - Your own dump of NHL 27: **PPSA34063, tested with 01.003.001**.
 
 Tested on a Ryzen 7 9800X3D, an RTX 5080 and 32 GB of RAM. Other GPUs have not been tried here.
@@ -82,8 +76,6 @@ Tested on a Ryzen 7 9800X3D, an RTX 5080 and 32 GB of RAM. Other GPUs have not b
   player, and a silent exit right after the window opens.
 - **Starting again right after closing** can fail with `could not reserve 13824 MB for guest direct memory`. Wait a
   few seconds and try again.
-- **Frame generation** (experimental): input lag goes up a little, the HUD can smear in fast moves, and VSync is
-  off while it is on.
 - If your profile shows "Sign in required", press OK. Offline modes work; online modes don't (yet).
 - The upstream known bugs (jersey cloth, some skin tones, facial hair, bright pixels, logos) are unchanged.
 
@@ -115,14 +107,11 @@ duy64 (KytyPS5-nhl and its NHL 27 fixes), nmzik, TheCruZ, Artyom Zabroda, superk
 [KytyPS5](https://github.com/KytyPS5/KytyPS5) authors, on top of the original [Kyty](https://github.com/InoriRus/Kyty).
 AnyPS5 (boykopovar) was used as a reference only; no code was copied from it.
 
-Upscaling SDKs (binaries only, under their own licences; the texts are in `builds/rc10/licenses/` in the release zip):
+Upscaling SDKs (binaries only, under their own licences; the texts are in `builds/rc8/licenses/` in the release zip):
 Intel XeSS SDK 3.0.2 (XeSS Super Resolution, (c) Intel Corporation, `libxess.dll`) and the NVIDIA DLSS SDK 310.9.16
 NGX library, (c) NVIDIA Corporation, linked into the emulator, with its `nvngx_dlss.dll`. DLSS needs a GeForce RTX
 card and a recent NVIDIA driver.
-Frame generation uses NVIDIA DLSS Frame Generation (`nvngx_dlssg.dll`, (c) NVIDIA Corporation, NVIDIA RTX SDK
-licence) through the NVIDIA Streamline SDK 2.14.16 (`sl.*.dll`, MIT licence). It needs a GeForce RTX 40 or 50
-series card.
-NVIDIA, GeForce RTX, DLSS, Intel and XeSS are trademarks of their owners; this project is not affiliated with or endorsed by them.
+NVIDIA, DLSS, Intel and XeSS are trademarks of their owners; this project is not affiliated with or endorsed by them.
 
 The changes, measurements and notes were made with an AI coding assistant (Claude) driving the builds, test runs and
 log analysis; play testing is by hand. Each release's details are in [CHANGELOG.md](CHANGELOG.md).
@@ -131,7 +120,7 @@ log analysis; play testing is by hand. Each release's details are in [CHANGELOG.
 
 Faceoff is an unofficial fan project by [Puck Peak](https://www.puckpeak.com). It is not affiliated with, endorsed by
 or sponsored by Electronic Arts, EA SPORTS, Sony Interactive Entertainment, the NHL or the NHLPA. All trademarks
-belong to their owners. Faceoff is free and nothing is sold; donations are voluntary and unlock nothing.
+belong to their owners. No money is made from this project.
 
 ## License
 

@@ -4,8 +4,10 @@
 #include "loader/guestInstructionPatcher.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
+#include "loader/x64InstructionEmulator.h"
 
 #include <Zydis/Zydis.h>
 #include <algorithm>
@@ -950,6 +952,57 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	}
 }
 
+#if defined(KYTY_SSE4A_TRAP_DIAG)
+// KYTY_FORCE_SSE4A_TRAP (diagnostic builds only, CMake KYTY_SSE4A_TRAP_DIAG): hosts with SSE4a would run
+// the site natively, so swap its opcode byte for UD1/UD0 (see x64InstructionEmulator.h); the emulator maps
+// it back.
+void MarkForcedSse4aTrap(u8* code, u8 length) noexcept {
+	u8 offset = 0;
+	while (offset < length && (code[offset] == 0x66 || code[offset] == 0xf2 || code[offset] == 0xf3 ||
+	                           (code[offset] & 0xf0u) == 0x40u)) {
+		++offset;
+	}
+	if (offset + 1 >= length || code[offset] != 0x0f) {
+		return;
+	}
+	if (code[offset + 1] == 0x78) {
+		code[offset + 1] = X64InstructionEmulator::Sse4aTrapImmediateOpcode;
+	} else if (code[offset + 1] == 0x79) {
+		code[offset + 1] = X64InstructionEmulator::Sse4aTrapRegisterOpcode;
+	}
+}
+
+// KYTY_FORCE_SSE4A_TRAP, after CollectAmdInstructions: keep only its SSE4a sites unless --amd-cpu is on
+// too, and mark each one in place before relocation, so the relocated copy (GenerateInstructionTrap
+// copies the guest bytes) and an unrelocated site both trap. Its call cost PatchGuestInstructions the
+// PGO profile at both positions tried (2026-11-21 probe builds), hence diagnostic builds only.
+[[gnu::noinline]] void ApplyForcedSse4aTrap(const DecodedFunction&                   function,
+                                            std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                            GuestInstructionPatchResult&             result) noexcept {
+	if (!X64InstructionEmulator::ForceSse4aTrap()) {
+		return;
+	}
+	const bool emulate_amd = Config::AmdCpuEnabled();
+	for (auto it = rewrite_sites.begin(); it != rewrite_sites.end();) {
+		auto&      rewrite     = it->second;
+		const auto replacement = rewrite.replacement;
+		if (replacement == InstructionReplacement::ExtractQ ||
+		    replacement == InstructionReplacement::InsertQ) {
+			MarkForcedSse4aTrap(reinterpret_cast<u8*>(it->first),
+			                    function.instructions.at(it->first).instruction.length);
+		} else if (!emulate_amd && replacement != InstructionReplacement::None) {
+			--ReplacementCounts(result, replacement).found;
+			rewrite.replacement = InstructionReplacement::None;
+			if (!rewrite.protect_red_zone && !rewrite.protected_indirect_call) {
+				it = rewrite_sites.erase(it);
+				continue;
+			}
+		}
+		++it;
+	}
+}
+#endif
+
 void MarkInstructionTrap(u8* code, const ZydisDecodedInstruction& instruction,
                          InstructionReplacement replacement) {
 	if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
@@ -1488,8 +1541,12 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 			Xbyak::util::Cpu::getCpuidEx(7, 0, leaf);
 			rdpid = (leaf[2] & (1u << 22)) != 0;
 		}
-		return GuestInstructionHostFeatures {cpu.has(Xbyak::util::Cpu::tSSE4a), rdpid,
-		                                     cpu.has(Xbyak::util::Cpu::tCLWB)};
+		// KYTY_FORCE_SSE4A_TRAP treats the host as having no SSE4a, as on Intel.
+		// Plain bools and `&`, not `&&` around the call, so the PGO profile keeps its shape.
+		const bool host_sse4a  = cpu.has(Xbyak::util::Cpu::tSSE4a);
+		const bool force_sse4a = X64InstructionEmulator::ForceSse4aTrap();
+		const bool sse4a       = host_sse4a & !force_sse4a;
+		return GuestInstructionHostFeatures {sse4a, rdpid, cpu.has(Xbyak::util::Cpu::tCLWB)};
 	}();
 	return features;
 }
@@ -1499,6 +1556,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
                                                    bool protect_memory, bool emulate_amd,
                                                    GuestInstructionHostFeatures host_features) {
 	GuestInstructionPatchResult result {};
+	// emulate_amd is also on for KYTY_FORCE_SSE4A_TRAP (LoadProgramToMemory; diagnostic builds only, where
+	// ApplyForcedSse4aTrap keeps only the SSE4a sites unless --amd-cpu is on too). In shipping builds this
+	// function is unchanged and keeps its PGO profile.
 	if (!protect_memory && !emulate_amd) {
 		return result;
 	}
@@ -1551,6 +1611,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		}
 		if (emulate_amd) {
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
+#if defined(KYTY_SSE4A_TRAP_DIAG)
+			ApplyForcedSse4aTrap(function, rewrite_sites, result);
+#endif
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result);

@@ -10,7 +10,10 @@
 #include <windows.h> // IWYU pragma: keep
 
 #include "common/assert.h"
+#include "common/hostStats.h"
 #include "common/virtualMemory.h"
+
+#include <atomic>
 
 // IWYU pragma: no_include <basetsd.h>
 // IWYU pragma: no_include <errhandlingapi.h>
@@ -44,6 +47,16 @@ static DWORD GetProtectionFlag(Mode mode) {
 	return protect;
 }
 
+// NHL27OOM (the first 8): Windows refused a commit because the commit charge (RAM plus paging
+// files) is used up, the usual reason a long session crashes here.
+static void NoteCommitFailure(uint32_t error, uint64_t size) {
+	static std::atomic<uint32_t> reports {0};
+	if ((error == ERROR_COMMITMENT_LIMIT || error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY) &&
+	    reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+		Common::PrintOutOfCommit("VirtualAlloc", size);
+	}
+}
+
 void Init() {}
 
 uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
@@ -57,6 +70,7 @@ uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
 
 		if (err != ERROR_INVALID_ADDRESS) {
 			printf("VirtualAlloc() failed: 0x%08" PRIx32 "\n", err);
+			NoteCommitFailure(err, size);
 		} else {
 			return AllocAligned(address, size, mode, 1);
 		}
@@ -147,6 +161,7 @@ bool AllocFixed(uint64_t address, uint64_t size, Mode mode) {
 		auto err = static_cast<uint32_t>(GetLastError());
 
 		printf("VirtualAlloc() failed: 0x%08" PRIx32 "\n", err);
+		NoteCommitFailure(err, size);
 		return false;
 	}
 
@@ -164,8 +179,9 @@ bool Commit(uint64_t address, uint64_t size, Mode mode) {
 	    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                 static_cast<DWORD>(MEM_COMMIT), GetProtectionFlag(mode)));
 	if (ptr == 0) {
-		printf("VirtualAlloc(MEM_COMMIT) failed: 0x%08" PRIx32 "\n",
-		       static_cast<uint32_t>(GetLastError()));
+		const auto err = static_cast<uint32_t>(GetLastError());
+		printf("VirtualAlloc(MEM_COMMIT) failed: 0x%08" PRIx32 "\n", err);
+		NoteCommitFailure(err, size);
 		return false;
 	}
 

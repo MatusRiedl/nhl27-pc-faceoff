@@ -7,6 +7,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/freezeDump.h"
 #include "common/lightingTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -917,6 +918,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 			if (report) ctx_report_us[i] = now_us + 5000000u;
 			const auto flips  = static_cast<uint64_t>(ctx.flip_status.count);
 			const int  rate   = ctx.requested_flip_rate;
+			Common::FreezeDump::NoteVblank(i, ctx.vblank_status.count, flips); // NHL27FREEZE watchdog
 			ctx.mutex.Unlock();
 			if (report) {
 				std::printf("NHL27FPS: handle=%d t=%.1f s flips=%" PRIu64 " rate=%d\n", i,

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/hostCopyQueue.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/submitNotes.h"
 
 #include <array>
 #include <atomic>
@@ -103,6 +104,11 @@ public:
 	// deferred recording (null otherwise). Submissions wait for the copies recorded before them;
 	// the owner of the scheduler drains them before any guest-visible effect.
 	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
+	// Freeze report: NHL27SUBMIT lines with each scheduler's unfinished submissions and the
+	// semaphore values they wait for (submitNotes.h). Lock-free reads plus semaphore value queries.
+	static void PrintFreezeSubmits() noexcept;
+	// Freeze report: the NHL27HANG / NHL27HANGHEAD lines (the unfinished draws and dispatches).
+	static void PrintFreezeCommands() noexcept;
 
 private:
 	void QueueOperation(Common::UniqueFunction<void>&& operation);
@@ -183,6 +189,8 @@ private:
 	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
 	// Last tick whose submission reached vkQueueSubmit (submissions are made in tick order).
 	std::atomic<uint64_t>        m_submitted_tick {0};
+	// The last submissions with their waits and signals, by tick (freeze report).
+	SubmitNotes::Ring            m_submit_notes;
 	// Calls since draws last queried the GPU timeline for pending operations.
 	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;

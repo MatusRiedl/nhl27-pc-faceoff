@@ -1,6 +1,7 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
+#include "common/hitchWhy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -488,3 +489,80 @@ int Thread::GetThreadIdUnique() {
 }
 
 } // namespace Common
+
+// NHL27HITCHWHY d_cpu / c_cpu (KYTY_HITCH_CPU=1, common/hitchWhy.h). Here because this file already has
+// the Windows thread calls and is linked into every target.
+namespace Common::HitchWhy {
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+namespace {
+// 0 the draw thread, 1 the command thread. Set by that thread, read by the presenting thread. A handle
+// that is replaced stays open: the reader may still hold it.
+std::atomic<HANDLE> g_cpu_thread[2] {};
+} // namespace
+
+void CpuRegisterCurrent(Role role) noexcept {
+	const int index = role == Role::Draw ? 0 : (role == Role::Cp ? 1 : -1);
+	if (index < 0 || !CpuEnabled()) {
+		return;
+	}
+	HANDLE handle = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+	                    THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0) == 0) {
+		return;
+	}
+	g_cpu_thread[index].store(handle, std::memory_order_release);
+}
+
+bool CpuTake(double* draw_ms, double* cp_ms, double* cycles_per_us) noexcept {
+	struct Seen {
+		HANDLE   handle;
+		uint64_t first_cycles, first_time; // at first sight (time: 100 ns units of kernel + user)
+		uint64_t last_cycles;
+	};
+	static Seen seen[2] {};
+	uint64_t    delta[2] {};
+	bool        valid[2] {};
+	uint64_t    run_cycles = 0;
+	uint64_t    run_time   = 0;
+	for (int i = 0; i < 2; i++) {
+		HANDLE handle = g_cpu_thread[i].load(std::memory_order_acquire);
+		ULONG64 cycles = 0;
+		FILETIME created {}, exited {}, kernel {}, user {};
+		if (handle == nullptr || QueryThreadCycleTime(handle, &cycles) == 0 ||
+		    GetThreadTimes(handle, &created, &exited, &kernel, &user) == 0) {
+			continue;
+		}
+		const auto as_u64 = [](const FILETIME& t) {
+			return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+		};
+		const uint64_t time = as_u64(kernel) + as_u64(user);
+		auto&          s    = seen[i];
+		if (s.handle != handle) {
+			s = {handle, cycles, time, cycles};
+			continue;
+		}
+		delta[i] = cycles - s.last_cycles;
+		s.last_cycles = cycles;
+		valid[i]      = true;
+		run_cycles += cycles - s.first_cycles;
+		run_time += time - s.first_time;
+	}
+	// 1 s of CPU together before the first result: the thread times advance in clock ticks.
+	if (!valid[0] || run_time < 10000000ull || run_cycles == 0) {
+		return false;
+	}
+	const double per_100ns = static_cast<double>(run_cycles) / static_cast<double>(run_time);
+	*draw_ms               = static_cast<double>(delta[0]) / per_100ns / 1e4;
+	*cp_ms                 = valid[1] ? static_cast<double>(delta[1]) / per_100ns / 1e4 : -1.0;
+	*cycles_per_us         = per_100ns * 10.0;
+	return true;
+}
+#else
+void CpuRegisterCurrent(Role /*role*/) noexcept {}
+bool CpuTake(double* /*draw_ms*/, double* /*cp_ms*/, double* /*cycles_per_us*/) noexcept {
+	return false;
+}
+#endif
+
+} // namespace Common::HitchWhy

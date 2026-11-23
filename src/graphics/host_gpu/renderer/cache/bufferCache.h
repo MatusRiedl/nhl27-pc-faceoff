@@ -43,6 +43,8 @@ struct BufferMemoryStats {
 	uint64_t retries = 0;
 };
 [[nodiscard]] BufferMemoryStats BufferCacheMemoryStats();
+// NHL27RDWAIT: guest-thread read waits since the last call (writer retries, escapes, async reads).
+void BufferCachePrintReadWaits();
 
 class BufferCache {
 public:
@@ -389,6 +391,10 @@ private:
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void DropGpuFills(uint64_t vaddr, uint64_t size);
 	void LogGpuWrite(uint64_t vaddr, uint64_t size);
+	// ReadMemory's waits, kept out of it so its PGO profile still matches (bufferCache.cpp).
+	[[nodiscard]] uint64_t RetryWriterSubmit(uint64_t retry_tick);
+	void RetryWriterWait(uint64_t retry_tick, uint64_t vaddr, uint32_t attempt, uint64_t start);
+	void AsyncReadWait(uint64_t async_tick);
 	void PerfMaybePrint();
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);

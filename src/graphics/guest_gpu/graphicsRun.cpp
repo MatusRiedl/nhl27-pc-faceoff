@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -885,6 +886,7 @@ void GuestGpu::ExecutionThread() {
 	g_gpu_thread    = true;
 	g_execution_gpu = this;
 	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Draw);
+	Common::HitchWhy::CpuRegisterCurrent(Common::HitchWhy::Role::Draw);
 	RegionManager::MarkGpuOrderedThread();
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
@@ -2049,6 +2051,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = !gpu->m_pipelined;
 	g_cp_thread  = gpu->m_pipelined;
 	Common::HitchWhy::SetRole(gpu->m_pipelined ? Common::HitchWhy::Role::Cp : Common::HitchWhy::Role::Draw);
+	Common::HitchWhy::CpuRegisterCurrent(gpu->m_pipelined ? Common::HitchWhy::Role::Cp : Common::HitchWhy::Role::Draw);
 	RegionManager::MarkGpuOrderedThread();
 	g_gpu_state  = gpu;
 	if (gpu->m_pipelined) {
@@ -3342,6 +3345,7 @@ bool CommandProcessor::TryExecuteNativeIndirect(const GpuOperation& operation) {
 	                           .max_count         = indirect.max_count,
 	                           .stride            = indirect.stride,
 	                           .indexed           = indirect.indexed,
+	                           .prep              = static_cast<bool>(indirect.indexed | (NativeIndirectGuardMaxWork() != 0)),
 	                           .index_base        = indirect.index_base,
 	                           .index_count_limit = indirect.index_buffer_size,
 	                           .index_type        = indirect.index_type,

@@ -35,6 +35,11 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/crosscreaseOnline.h"
+
+// CrossCrease online: trace the network and NP functions the game calls.
+#undef PRINT_NAME
+#define PRINT_NAME() CROSSCREASE_PRINT_NAME()
 
 #include <algorithm>
 #include <array>
@@ -52,6 +57,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -154,6 +160,11 @@ public:
 	bool HttpSetAutoRedirect(Id id, int enable);
 	bool HttpSetAuthEnabled(Id id, int enable);
 	bool HttpMarkRequestSent(Id req_id, int result);
+	// CrossCrease online: real sends through the CrossCrease HTTP gateway (crosscreaseOnline.h).
+	int  HttpSend(Id req_id, const void* post_data, size_t size, bool* nonblock);
+	int  HttpReadData(Id req_id, void* data, size_t size);
+	// 0 = not started or in flight, 1 = finished, -1 = finished with an error.
+	int  HttpRequestState(Id req_id);
 	bool HttpGetRequestResponse(Id req_id, int* send_result, int* status_code, const char** headers,
 	                            size_t* headers_size, uint64_t* content_length);
 
@@ -228,6 +239,11 @@ private:
 		int         send_result    = HTTP_ERROR_BEFORE_SEND;
 		int         status_code    = 0;
 		std::string response_headers;
+		// CrossCrease online
+		std::shared_ptr<CrossCreaseOnline::HttpExchange> exchange;
+		std::shared_ptr<std::atomic<bool>>               exchange_done;
+		std::string                                      response_body;
+		size_t                                           read_offset = 0;
 	};
 
 	HttpBase* FindHttpBase(Id id, bool include_request);
@@ -657,10 +673,122 @@ bool Network::HttpGetRequestResponse(Id req_id, int* send_result, int* status_co
 		*headers_size = request.response_headers.size();
 	}
 	if (content_length != nullptr) {
-		*content_length = 0;
+		*content_length = request.response_body.size();
 	}
 
 	return true;
+}
+
+int Network::HttpSend(Id req_id, const void* post_data, size_t size, bool* nonblock) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValidRequest(req_id)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	auto& request = m_requests[req_id.GetId()];
+	*nonblock     = request.nonblock;
+	if (request.send_attempted) {
+		return request.send_result;
+	}
+
+	if (request.exchange == nullptr) {
+		std::string url = request.url;
+		if (url.find("://") == std::string::npos) {
+			const auto& base = static_cast<const HttpConnection&>(request).url;
+			url              = base + (url.empty() || url[0] != '/' ? "/" : "") + url;
+		}
+		switch (CrossCreaseOnline::HttpRouteFor(url)) {
+			case CrossCreaseOnline::HttpRoute::Gateway: break;
+			case CrossCreaseOnline::HttpRoute::Blocked:
+				request.send_attempted = true;
+				request.send_result    = HTTP_ERROR_RESOLVER_ENOHOST;
+				return request.send_result;
+			default:
+				// No server to talk to: keep the emulator's offline behaviour.
+				request.send_attempted = true;
+				request.send_result    = HTTP_ERROR_TIMEOUT;
+				request.status_code    = 0; // Faceoff: as HttpMarkRequestSent did
+				request.response_headers.clear();
+				return request.send_result;
+		}
+		auto exchange    = std::make_shared<CrossCreaseOnline::HttpExchange>();
+		exchange->method = request.method;
+		exchange->url    = url;
+		bool has_agent   = false;
+		for (const auto& h: request.headers) {
+			exchange->headers.emplace_back(h.name, h.value);
+			has_agent = has_agent || (h.name == "User-Agent" || h.name == "user-agent");
+		}
+		if (!has_agent && !request.user_agent.empty()) {
+			exchange->headers.emplace_back("User-Agent", request.user_agent);
+		}
+		if (post_data != nullptr && size != 0) {
+			exchange->body.assign(static_cast<const char*>(post_data), size);
+		}
+		exchange->connect_timeout_ms = std::clamp<uint32_t>(request.connect_timeout / 1000, 1000, 30000);
+		exchange->recv_timeout_ms    = std::clamp<uint32_t>(request.recv_timeout / 1000, 1000, 120000);
+		auto done                    = std::make_shared<std::atomic<bool>>(false);
+		request.exchange             = exchange;
+		request.exchange_done        = done;
+		std::thread([exchange, done] {
+			CrossCreaseOnline::HttpPerform(exchange.get());
+			done->store(true, std::memory_order_release);
+		}).detach();
+	}
+
+	if (!request.exchange_done->load(std::memory_order_acquire)) {
+		return HTTP_ERROR_EAGAIN;
+	}
+
+	auto& x                  = *request.exchange;
+	request.send_attempted   = true;
+	request.status_code      = x.status;
+	request.response_headers = x.response_headers;
+	request.response_body    = std::move(x.response_body);
+	request.read_offset      = 0;
+	switch (x.error) {
+		case CrossCreaseOnline::HttpExchange::Error::None: request.send_result = OK; break;
+		case CrossCreaseOnline::HttpExchange::Error::BadResponse: request.send_result = HTTP_ERROR_BAD_RESPONSE; break;
+		default: request.send_result = HTTP_ERROR_NETWORK; break;
+	}
+	return request.send_result;
+}
+
+int Network::HttpReadData(Id req_id, void* data, size_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValidRequest(req_id)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	auto& request = m_requests[req_id.GetId()];
+	if (!request.send_attempted) {
+		return request.exchange != nullptr ? HTTP_ERROR_EAGAIN : HTTP_ERROR_BEFORE_SEND;
+	}
+	if (request.send_result != OK) {
+		return request.send_result;
+	}
+	const size_t n = std::min(size, request.response_body.size() - request.read_offset);
+	if (n != 0) {
+		std::memcpy(data, request.response_body.data() + request.read_offset, n);
+		request.read_offset += n;
+	}
+	return static_cast<int>(n);
+}
+
+int Network::HttpRequestState(Id req_id) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValidRequest(req_id)) {
+		return -1;
+	}
+	const auto& request = m_requests[req_id.GetId()];
+	if (request.send_attempted) {
+		return request.send_result == OK ? 1 : -1;
+	}
+	if (request.exchange_done != nullptr && request.exchange_done->load(std::memory_order_acquire)) {
+		return request.exchange->error == CrossCreaseOnline::HttpExchange::Error::None ? 1 : -1;
+	}
+	return 0;
 }
 
 bool Network::HttpDeleteTemplate(Id tmpl_id) {
@@ -1461,8 +1589,9 @@ int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
-                                       int retry, int flags) {
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      NetResolverInfo* info, int timeout, int retry,
+                                                      int flags) {
 	PRINT_NAME();
 
 	LOGF("\t rid      = %d\n"
@@ -1472,10 +1601,12 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	     "\t flags    = 0x%08x\n",
 	     rid, hostname != nullptr ? hostname : "<null>", timeout, retry, flags);
 
-	(void)timeout;
-	(void)retry;
-
-	if (hostname == nullptr || addr == nullptr || (flags & ~0x00010000) != 0) {
+	// 0x00000001 is the async flag (NHL 27's DirtySDK resolver uses it): the lookup below completes
+	// immediately, which an async caller handles like an already-finished request.
+	// Faceoff: the async flag is accepted only with CrossCrease online on (offline: EINVAL, as before).
+	if (hostname == nullptr || info == nullptr ||
+	    (flags & ~(CrossCreaseOnline::Enabled() ? 0x00010001 : 0x00010000)) != 0) {
+		CrossCreaseOnline::Trace("dns %s -> rejected flags 0x%08x", hostname != nullptr ? hostname : "<null>", flags);
 		return NET_ERROR_EINVAL;
 	}
 
@@ -1484,8 +1615,36 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		return NET_ERROR_EBADF;
 	}
 
-	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, addr) == 1) {
+	*info = {};
+	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, &info->addrs[0].addr) == 1) {
+		CrossCreaseOnline::Trace("dns %s -> numeric", hostname);
+		info->addrs[0].af = 2;
+		info->records     = 1;
+		info->dns4records = 1;
 		return OK;
+	}
+
+	// CrossCrease online: configured host overrides (see crosscreaseOnline.h).
+	{
+		uint32_t mapped = 0;
+		switch (CrossCreaseOnline::ResolveHost(hostname, &mapped)) {
+			case CrossCreaseOnline::HostResult::Mapped:
+				// NHL 27's EADP SDK resolves the gRPC hosts with the async flag (0x00000001) and
+				// then reads the returned IPv4 address byte-reversed (confirmed live: a 127.0.0.1
+				// mapping produced a connect to 1.0.0.127). Pre-swap the four address bytes for the
+				// async path so the game un-reverses it back to the real address.
+				if ((flags & 0x00000001) != 0) {
+					mapped = __builtin_bswap32(mapped);
+					CrossCreaseOnline::Trace("dns %s -> async byte-swapped", hostname);
+				}
+				info->addrs[0].addr = mapped;
+				info->addrs[0].af   = 2;
+				info->records       = 1;
+				info->dns4records   = 1;
+				return OK;
+			case CrossCreaseOnline::HostResult::Blocked: return NET_ERROR_RESOLVER_ENOHOST;
+			default: break;
+		}
 	}
 
 	if (!EnsureSocketBackend()) {
@@ -1514,15 +1673,35 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
 		    ai->ai_addrlen >= sizeof(sockaddr_in)) {
-			const auto* in = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-			std::memcpy(addr, &in->sin_addr, sizeof(in->sin_addr));
-			freeaddrinfo(result);
-			return OK;
+			if (info->records < static_cast<int>(std::size(info->addrs))) {
+				NetResolverAddr& out = info->addrs[info->records++];
+				const auto*      in  = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+				std::memcpy(&out.addr, &in->sin_addr, sizeof(out.addr));
+				out.af = 2;
+			}
+			info->dns4records++;
 		}
 	}
 
 	freeaddrinfo(result);
-	return NET_ERROR_RESOLVER_ENORECORD;
+	return info->records > 0 ? OK : NET_ERROR_RESOLVER_ENORECORD;
+}
+
+int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
+                                       int retry, int flags) {
+	PRINT_NAME();
+
+	if (addr == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	NetResolverInfo info;
+	const int       ret =
+	    NetResolverStartNtoaMultipleRecords(rid, hostname, &info, timeout, retry, flags);
+	if (ret == OK) {
+		std::memcpy(addr, &info.addrs[0].addr, sizeof(info.addrs[0].addr));
+	}
+	return ret;
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
@@ -1929,6 +2108,18 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 		return -1;
 	}
 
+	// CrossCrease online: a per-player address lets two players share one PC.
+	if (const uint32_t local = CrossCreaseOnline::LocalAddress();
+	    local != 0 && host_addr.ss_family == AF_INET) {
+		auto& in = reinterpret_cast<sockaddr_in&>(host_addr);
+		uint32_t bound = 0;
+		std::memcpy(&bound, &in.sin_addr, sizeof(bound));
+		if (bound == 0) {
+			std::memcpy(&in.sin_addr, &local, sizeof(local));
+		}
+	}
+	CrossCreaseOnline::TraceSockaddr("bind", s, &host_addr);
+
 	if (state.p2p) {
 		if (addrlen < 16) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
@@ -2017,6 +2208,30 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 	SocketLength     host_addrlen = 0;
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 		return -1;
+	}
+
+	// CrossCrease online: move ports the server cannot use (port_map), trace, and leave from this
+	// player's own address when one is set.
+	if (host_addr.ss_family == AF_INET) {
+		auto&    target    = reinterpret_cast<sockaddr_in&>(host_addr);
+		uint32_t target_ip = 0;
+		std::memcpy(&target_ip, &target.sin_addr, sizeof(target_ip));
+		target.sin_port = htons(CrossCreaseOnline::RemapPort(target_ip, ntohs(target.sin_port)));
+	}
+	CrossCreaseOnline::TraceSockaddr("connect", s, &host_addr);
+	if (const uint32_t local = CrossCreaseOnline::LocalAddress();
+	    local != 0 && host_addr.ss_family == AF_INET) {
+		const auto& target   = reinterpret_cast<const sockaddr_in&>(host_addr);
+		uint32_t    target_ip = 0;
+		std::memcpy(&target_ip, &target.sin_addr, sizeof(target_ip));
+		const bool  loopback = (ntohl(target_ip) >> 24u) == 127u;
+		if (loopback || (ntohl(local) >> 24u) != 127u) {
+			sockaddr_in from {};
+			from.sin_family = AF_INET;
+			std::memcpy(&from.sin_addr, &local, sizeof(local));
+			// Fails harmlessly when the guest already bound the socket.
+			(void)::bind(socket, reinterpret_cast<const sockaddr*>(&from), sizeof(from));
+		}
 	}
 
 	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
@@ -2366,6 +2581,7 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 		if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 			return -1;
 		}
+		CrossCreaseOnline::TraceSockaddr("sendto", s, &host_addr);
 		result = ::sendto(socket, static_cast<const char*>(buf), host_len, host_flags,
 		                  reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen);
 	}
@@ -2401,8 +2617,15 @@ static int ReceiveStream(SocketTransport& transport, char* output, int length, i
 			transport.buffered_bytes.store(buffered.size(), std::memory_order_relaxed);
 		}
 	}
-	if (copied == length || (copied != 0 && !waitall)) {
+	// Faceoff: offline keeps the old early return; the top-up below is for CrossCrease online only.
+	if (copied == length || (copied != 0 && !waitall && !CrossCreaseOnline::Enabled())) {
 		return copied;
+	}
+	// DirtySDK peeks one byte before reading a whole packet. Returning that buffered
+	// byte alone limits it to one byte per tick. Top up with immediately available
+	// socket data, without making an ordinary partial read wait for more bytes.
+	if (copied != 0 && !waitall) {
+		dontwait = true;
 	}
 
 	// Winsock rejects PEEK | WAITALL. Consume into transport-owned storage when peeking,
@@ -3254,18 +3477,61 @@ int KYTY_SYSV_ABI HttpUnsetEpoll(int id) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* /*post_data*/, size_t /*size*/) {
+int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* post_data, size_t size) {
 	PRINT_NAME();
 
 	LOGF("\t request_id = %d\n", request_id);
 
 	EXIT_IF(g_net == nullptr);
 
-	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_TIMEOUT)) {
-		return HTTP_ERROR_INVALID_ID;
+	for (;;) {
+		bool      nonblock = false;
+		const int result   = g_net->HttpSend(Network::Id(request_id), post_data, size, &nonblock);
+		if (result != HTTP_ERROR_EAGAIN || nonblock) {
+			return result;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+}
+
+int KYTY_SYSV_ABI HttpReadData(int request_id, void* data, size_t size) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t size       = %" PRIu64 "\n",
+	     request_id, static_cast<uint64_t>(size));
+
+	EXIT_IF(g_net == nullptr);
+
+	if (data == nullptr && size != 0) {
+		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	return HTTP_ERROR_TIMEOUT;
+	return g_net->HttpReadData(Network::Id(request_id), data, size);
+}
+
+int KYTY_SYSV_ABI HttpsEnableOption(int id, uint32_t ssl_flags) {
+	PRINT_NAME();
+
+	LOGF("\t id        = %d\n"
+	     "\t ssl_flags = 0x%08" PRIx32 "\n",
+	     id, ssl_flags);
+
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
+}
+
+int KYTY_SYSV_ABI HttpsSetSslVersion(int id, int version) {
+	PRINT_NAME();
+
+	LOGF("\t id      = %d\n"
+	     "\t version = %d\n",
+	     id, version);
+
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
 }
 
 int KYTY_SYSV_ABI HttpAbortRequest(int request_id) {
@@ -3298,7 +3564,31 @@ int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int max
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	return 0;
+	if (!CrossCreaseOnline::Enabled()) {
+		return 0; // Faceoff: offline reports no events at once, as before
+	}
+	// CrossCrease online: report the epoll's request once its gateway exchange has finished.
+	constexpr uint32_t NB_EVENT_IN       = 0x01;
+	constexpr uint32_t NB_EVENT_SOCK_ERR = 0x08;
+	if (maxevents == 0 || eh->request_id.GetType() != Network::Id::Type::Request) {
+		return 0;
+	}
+	const auto deadline = std::chrono::steady_clock::now() +
+	                      std::chrono::microseconds(timeout < 0 ? 100'000 : timeout);
+	for (;;) {
+		const int state = g_net->HttpRequestState(eh->request_id);
+		if (state != 0) {
+			nbev[0].events       = state > 0 ? NB_EVENT_IN : NB_EVENT_SOCK_ERR;
+			nbev[0].event_detail = 0;
+			nbev[0].id           = eh->request_id.ToInt();
+			nbev[0].user_arg     = eh->user_arg;
+			return 1;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return 0;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
 }
 
 int KYTY_SYSV_ABI HttpGetStatusCode(int request_id, int* status_code) {
@@ -3663,26 +3953,52 @@ static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 }
 #endif
 
-static HostNetworkInfo QueryHostNetworkInfo() {
+static HostNetworkInfo QueryHostNetworkInfoNow() {
 	HostNetworkInfo info;
-#if defined(_WIN32)
-	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS;
-	ULONG size  = 0;
-	auto  ret   = GetAdaptersAddresses(AF_INET, flags, nullptr, nullptr, &size);
-	if (ret != ERROR_BUFFER_OVERFLOW || size == 0) {
+	// An explicitly configured local CrossCrease network uses the loopback
+	// interface. Its reachability does not depend on Ethernet/Wi-Fi link state.
+	if (const uint32_t local = CrossCreaseOnline::LocalAddress();
+	    local != 0 && (ntohl(local) >> 24u) == 127u) {
+		info.connected = true;
+		const auto address = CrossCreaseOnline::LocalAddressString();
+		std::strncpy(info.ip_address, address.c_str(), sizeof(info.ip_address) - 1);
+		std::strncpy(info.netmask, "255.0.0.0", sizeof(info.netmask) - 1);
+		std::strncpy(info.default_route, "127.0.0.1", sizeof(info.default_route) - 1);
+		std::strncpy(info.primary_dns, "127.0.0.1", sizeof(info.primary_dns) - 1);
 		return info;
 	}
-
-	std::vector<uint8_t> buffer(size);
-	auto*                adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
-	ret = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size);
+#if defined(_WIN32)
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS;
+	// The adapter list can grow between the size query and the read (VPN adapters coming up),
+	// so retry instead of reporting "no network" for that moment.
+	ULONG                size = 16 * 1024;
+	std::vector<uint8_t> buffer;
+	ULONG                ret = ERROR_BUFFER_OVERFLOW;
+	for (int attempt = 0; attempt < 4 && ret == ERROR_BUFFER_OVERFLOW; attempt++) {
+		buffer.assign(size, 0);
+		ret = GetAdaptersAddresses(AF_INET, flags, nullptr,
+		                           reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
+	}
 	if (ret != NO_ERROR) {
 		return info;
 	}
+	auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
 
+	// Report the adapter Windows routes Internet traffic through. The game binds its sockets to
+	// this address, so a VPN adapter listed first (Tailscale, ZeroTier, ...) would otherwise
+	// capture connections it cannot carry. GetBestInterface only consults the routing table.
+	DWORD internet_if = 0;
+	// Faceoff: online only; offline keeps the old first-adapter choice.
+	if (!CrossCreaseOnline::Enabled() || GetBestInterface(htonl(0x08080808u), &internet_if) != NO_ERROR) {
+		internet_if = 0;
+	}
+	for (int pass = (internet_if != 0 ? 0 : 1); pass < 2; pass++)
 	for (auto* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
 		if (adapter->OperStatus != IfOperStatusUp || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
 		    adapter->IfType == IF_TYPE_TUNNEL) {
+			continue;
+		}
+		if (pass == 0 && adapter->IfIndex != internet_if) {
 			continue;
 		}
 
@@ -3787,6 +4103,48 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 	freeifaddrs(addresses);
 	return info;
 #endif
+}
+
+// Games poll the connection state every frame and treat one "disconnected" as losing PSN (NHL 27
+// leaves the online match). Host adapters change briefly (VPN reconnects, DHCP renewals,
+// adapter list races), so the host is queried at most once a second and a lost connection is
+// only reported after it has stayed lost for several seconds.
+static HostNetworkInfo QueryHostNetworkInfo() {
+	if (!CrossCreaseOnline::Enabled()) {
+		return QueryHostNetworkInfoNow(); // Faceoff: offline asks the host every time, as before
+	}
+	using Clock                     = std::chrono::steady_clock;
+	constexpr auto refresh_interval = std::chrono::seconds(1);
+	constexpr auto loss_grace       = std::chrono::seconds(10);
+
+	static std::mutex        mutex;
+	static HostNetworkInfo   cached;
+	static Clock::time_point last_query;
+	static Clock::time_point last_connected;
+	static bool              queried = false;
+
+	std::lock_guard lock(mutex);
+	const auto      now = Clock::now();
+	if (queried && now - last_query < refresh_interval) {
+		return cached;
+	}
+	queried    = true;
+	last_query = now;
+
+	auto info = QueryHostNetworkInfoNow();
+	if (info.connected) {
+		cached         = info;
+		last_connected = now;
+	} else if (cached.connected && now - last_connected < loss_grace) {
+		CrossCreaseOnline::Trace("netctl host network briefly unavailable; keeping %s",
+		                         cached.ip_address);
+	} else {
+		if (cached.connected) {
+			CrossCreaseOnline::Trace("netctl host network lost");
+		}
+		cached = info;
+	}
+	return cached;
 }
 
 static bool NetCtlConnected() {
@@ -3957,8 +4315,11 @@ int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
 		case 12: break;
 		case 13: break;
 		case 14:
-			std::strncpy(info->ip_address, host.ip_address,
-			             sizeof(info->ip_address) - 1);
+			if (const auto local = CrossCreaseOnline::LocalAddressString(); !local.empty()) {
+				std::strncpy(info->ip_address, local.c_str(), sizeof(info->ip_address) - 1);
+			} else {
+				std::strncpy(info->ip_address, host.ip_address, sizeof(info->ip_address) - 1);
+			}
 			break;
 		case 15:
 			std::strncpy(info->netmask, host.netmask, sizeof(info->netmask) - 1);
@@ -4000,6 +4361,11 @@ struct NpCountryCode {
 	char data[2];
 	char term;
 	char padding[1];
+};
+
+struct NpLanguageCode {
+	char code[36];
+	char padding[12];
 };
 
 struct NpAgeRestriction {
@@ -4050,14 +4416,31 @@ struct NpCheckPremiumResult {
 
 constexpr int      np_error_invalid_argument            = -2141913085; /* 0x80550003 */
 constexpr int      np_error_signed_out                  = -2141913082; /* 0x80550006 */
+constexpr int      np_error_user_not_found              = -2141913081; /* 0x80550007 */
 constexpr int      np_error_callback_already_registered = -2141913080; /* 0x80550008 */
 constexpr int      np_error_invalid_size                = -2141913071; /* 0x80550011 */
 constexpr int      np_error_aborted                     = -2141913070; /* 0x80550012 */
 constexpr int      np_error_request_max                 = -2141913069; /* 0x80550013 */
 constexpr int      np_error_request_not_found           = -2141913068; /* 0x80550014 */
 constexpr int      np_error_invalid_id                  = -2141913067; /* 0x80550015 */
+constexpr int      np_error_network_not_available       = -2141872086; /* 0x8055a02a */
 constexpr int      np_request_max                       = 128;
 constexpr uint32_t np_state_signed_out                  = 1;
+constexpr uint32_t np_state_signed_in                   = 2;
+constexpr uint64_t np_account_id                        = 0x00000000feedfaceull;
+
+// A simulated account belongs only to the primary user and survives network loss.
+bool IsSignedIn(int user_id) {
+	return CrossCreaseOnline::Enabled() && user_id == Config::GetUserId();
+}
+
+static int np_reachability_result(int user_id) {
+	if (!IsSignedIn(user_id)) {
+		return np_error_signed_out;
+	}
+	// This is an explicit compatibility simulation, not a connection to PSN.
+	return NetCtl::NetCtlConnected() ? OK : np_error_network_not_available;
+}
 
 struct NpStateCallback {
 	NpStateCallbackA callback = nullptr;
@@ -4117,7 +4500,7 @@ static NpRequest* np_get_request_locked(int req_id) {
 	return &g_np_requests[index];
 }
 
-static int np_complete_signed_out_locked(NpRequest* request) {
+static int np_complete_locked(NpRequest* request, int result) {
 	if (request->state == NpRequestState::Complete) {
 		request->result = np_error_invalid_argument;
 		return np_error_invalid_argument;
@@ -4128,9 +4511,9 @@ static int np_complete_signed_out_locked(NpRequest* request) {
 	}
 
 	request->state  = NpRequestState::Complete;
-	request->result = np_error_signed_out;
+	request->result = result;
 
-	return (request->async ? OK : np_error_signed_out);
+	return (request->async ? OK : result);
 }
 
 int KYTY_SYSV_ABI NpCheckCallback() {
@@ -4144,7 +4527,9 @@ int KYTY_SYSV_ABI NpCheckCallback() {
 		}
 	}
 	for (const auto& entry: pending) {
-		entry.callback(Config::GetUserId(), np_state_signed_out, entry.userdata);
+		entry.callback(Config::GetUserId(),
+		               IsSignedIn(Config::GetUserId()) ? np_state_signed_in : np_state_signed_out,
+		               entry.userdata);
 	}
 
 	return OK;
@@ -4239,12 +4624,14 @@ int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
 
 	EXIT_NOT_IMPLEMENTED(np_id == nullptr);
 
-	// int s = snprintf(np_id->handle.data, 16, "Kyty");
-	// EXIT_NOT_IMPLEMENTED(s >= 16);
-	// np_id->handle.term = 0;
 	std::memset(np_id, 0, sizeof(*np_id));
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		const auto id = CrossCreaseOnline::OnlineId("Kyty");
+		std::memcpy(np_id->handle.data, id.data(), std::min<size_t>(id.size(), 16));
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4255,12 +4642,14 @@ int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
 
 	EXIT_NOT_IMPLEMENTED(online_id == nullptr);
 
-	// int s = snprintf(online_id->data, 16, "Kyty");
-	// EXIT_NOT_IMPLEMENTED(s >= 16);
-	// online_id->term = 0;
 	std::memset(online_id, 0, sizeof(*online_id));
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		const auto id = CrossCreaseOnline::OnlineId("Kyty");
+		std::memcpy(online_id->data, id.data(), std::min<size_t>(id.size(), 16));
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4271,11 +4660,33 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 
 	EXIT_NOT_IMPLEMENTED(account_id == nullptr);
 
-	// *account_id = 0x00000000feedfaceull;
 	*account_id = 0;
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		*account_id = CrossCreaseOnline::AccountId(np_account_id);
+		return OK;
+	}
+
 	return np_error_signed_out;
+}
+
+int KYTY_SYSV_ABI NpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
+	PRINT_NAME();
+
+	LOGF("\t account_id = 0x%016" PRIx64 "\n", account_id);
+
+	if (account_id == 0 || user_id == nullptr) {
+		return np_error_invalid_argument;
+	}
+	if (!CrossCreaseOnline::Enabled()) {
+		return np_error_signed_out;
+	}
+	if (account_id != CrossCreaseOnline::AccountId(np_account_id)) {
+		return np_error_user_not_found;
+	}
+
+	*user_id = Config::GetUserId();
+	return OK;
 }
 
 int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
@@ -4287,10 +4698,12 @@ int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
 
 	auto* code = static_cast<NpCountryCode*>(country_code);
 	std::memset(code, 0, sizeof(*code));
-	// code->data[0] = '';
-	// code->data[1] = 'S';
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		std::memcpy(code->data, "US", 2);
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4305,11 +4718,19 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 		return np_error_invalid_argument;
 	}
 
-	// *age = 21;
-	*age = 0;
+	if (!CrossCreaseOnline::Enabled()) { // Faceoff: offline keeps the old answer
+		*age = 0;
+		return np_error_signed_out;
+	}
 
-	// return OK;
-	return np_error_signed_out;
+	std::lock_guard lock(g_np_request_mutex);
+	auto* request = np_get_request_locked(req_id);
+	if (request == nullptr) {
+		return np_error_request_not_found;
+	}
+
+	*age = IsSignedIn(user_id) ? 21 : 0;
+	return np_complete_locked(request, IsSignedIn(user_id) ? OK : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_code) {
@@ -4325,11 +4746,20 @@ int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_
 
 	std::lock_guard lock(g_np_request_mutex);
 
-	if (np_get_request_locked(req_id) == nullptr) {
+	auto* request = np_get_request_locked(req_id);
+	if (request == nullptr) {
 		return np_error_request_not_found;
 	}
 
-	return np_error_signed_out;
+	if (!CrossCreaseOnline::Enabled()) {
+		return np_error_signed_out; // Faceoff: offline keeps the old answer
+	}
+	auto* code = static_cast<NpLanguageCode*>(language_code);
+	std::memset(code, 0, sizeof(*code));
+	if (IsSignedIn(user_id)) {
+		std::memcpy(code->code, "en-US", 5);
+	}
+	return np_complete_locked(request, IsSignedIn(user_id) ? OK : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCreateRequest() {
@@ -4428,8 +4858,9 @@ int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* resu
 		return np_error_request_not_found;
 	}
 
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_locked(request, CrossCreaseOnline::OnlineId("Kyty") == user
+	                                       ? np_reachability_result(Config::GetUserId())
+	                                       : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
@@ -4451,8 +4882,7 @@ int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
 		return np_error_request_not_found;
 	}
 
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_locked(request, np_reachability_result(user_id));
 }
 
 int KYTY_SYSV_ABI NpPollAsync(int req_id, int* result) {
@@ -4509,23 +4939,12 @@ int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* para
 		return np_error_request_not_found;
 	}
 
-	if (request->state == NpRequestState::Complete) {
-		request->result = np_error_invalid_argument;
-		return np_error_invalid_argument;
-	}
-
-	if (request->state == NpRequestState::Aborted) {
-		return np_error_aborted;
-	}
-
 	std::memset(result, 0, sizeof(*result));
-	// result->authorized = true;
 
-	// request->state  = NpRequestState::Complete;
-	// request->result = OK;
-
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	// The emulated (signed-in) account has PlayStation Plus, so games that gate online multiplayer
+	// on NpCheckPremium (NHL 27 Online Versus) let the player in. Signed-out users stay unauthorized.
+	result->authorized = IsSignedIn(param->user_id);
+	return np_complete_locked(request, np_reachability_result(param->user_id));
 }
 
 int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
@@ -4535,7 +4954,7 @@ int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*state = np_state_signed_out;
+	*state = IsSignedIn(user_id) ? np_state_signed_in : np_state_signed_out;
 
 	return OK;
 }
@@ -4549,8 +4968,7 @@ int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	// *state = 2; // SCE_NP_REACHABILITY_STATE_REACHABLE
-	*state = 0; // SCE_NP_REACHABILITY_STATE_UNAVAILABLE
+	*state = np_reachability_result(user_id) == OK ? 2 : 0; // REACHABLE / UNAVAILABLE
 
 	return OK;
 }
@@ -4564,7 +4982,7 @@ int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*has_signed_up = false;
+	*has_signed_up = IsSignedIn(user_id);
 
 	return OK;
 }
