@@ -36,7 +36,7 @@ struct GraphicContext;
 //
 // Fails closed: any load, init, create or evaluate failure turns DLSS 5 off for the session and
 // the frame is presented as before; DLSS Super Resolution goes on. Frame generation (KYTY_DLSSG=1)
-// turns it off too. Logs: "NHL27DLSS5 status=... " once per stage, then "NHL27DLSS5 ms=..." every
+// can run too: it makes its frames from this pass's pictures at the present. Logs: "NHL27DLSS5 status=... " once per stage, then "NHL27DLSS5 ms=..." every
 // 5 s (GPU time of the copy and the evaluate).
 namespace Libs::Graphics::Dlss5 {
 

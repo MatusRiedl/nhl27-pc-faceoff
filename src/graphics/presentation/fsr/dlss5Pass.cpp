@@ -410,14 +410,9 @@ void CollectTiming(GraphicContext& graphics, uint32_t slot) {
 } // namespace
 
 bool Active() {
-	if (!Wanted() || g_failed.load(std::memory_order_relaxed)) return false;
-	// Frame generation presents frames the model never saw: not together on this first build.
-	static const bool frame_gen_checked = [] {
-		if (SwitchOn("KYTY_DLSSG")) Fail("frame generation is on (KYTY_DLSSG=1)");
-		return true;
-	}();
-	(void)frame_gen_checked;
-	return !g_failed.load(std::memory_order_relaxed);
+	// Frame generation (KYTY_DLSSG=1) may run too: it makes its frames at the present from the picture this pass
+	// wrote, so the generated frames are made from DLSS 5's pictures (the user's decision, 2026-11-24).
+	return Wanted() && !g_failed.load(std::memory_order_relaxed);
 }
 
 void LoadEarly() {
