@@ -23,6 +23,9 @@ int KYTY_SYSV_ABI KernelClearEventFlag(KernelEventFlag ef, uint64_t bit_pattern)
 int KYTY_SYSV_ABI KernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern,
                                         int* num_wait_threads);
 
+// NHL27EVFLAG every 30 s (totals since start; called every 5 s after the NHL27RDWAIT line).
+void PrintEventFlagStats();
+
 } // namespace Libs::LibKernel::EventFlag
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_EVENTFLAG_H_ */

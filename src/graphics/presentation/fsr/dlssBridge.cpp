@@ -1,6 +1,8 @@
 #include "graphics/presentation/fsr/dlssBridge.h"
+#include "graphics/presentation/fsr/dlss5Pass.h"
 
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/submitNotes.h"
 
 #include <algorithm>
 #include <array>
@@ -392,7 +394,8 @@ struct DlssBridge::Impl {
 		info.samples       = VK_SAMPLE_COUNT_1_BIT;
 		info.tiling        = VK_IMAGE_TILING_OPTIMAL;
 		info.usage         = index == Output ? (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT)
-		                                     : (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+		                                     : (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+		                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 		info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 		info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateImage(vk_device, &info, nullptr, &s.image) != VK_SUCCESS) {
@@ -582,6 +585,11 @@ struct DlssBridge::Impl {
 		eval.InPreExposure             = tuning.unit_pre_exposure ? 1.0f : p.pre_exposure;
 		eval.InFrameTimeDeltaInMsec    = p.delta_ms;
 		const auto result              = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, feature, params, &eval);
+		if (result == NVSDK_NGX_Result_Success) {
+			// DLSS 5 (KYTY_DLSS5, dlss5Pass.h): this frame's depth and vectors at display size.
+			Dlss5::RecordInputs(graphics, cmd, shared[Depth].image, shared[Motion].image, static_cast<VkExtent2D>(render),
+			                    static_cast<VkExtent2D>(display), eval.InMVScaleX, eval.InMVScaleY, p.reset);
+		}
 		for (auto& barrier: barriers) {
 			barrier.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
 			barrier.dstAccessMask       = 0;
@@ -617,11 +625,14 @@ struct DlssBridge::Impl {
 		submit.signalSemaphoreCount = 1;
 		submit.pSignalSemaphores    = &semaphore;
 		VkResult submitted          = VK_ERROR_INITIALIZATION_FAILED;
+		// Freeze report: the last wait and signal values handed to the queue (NHL27SUBMIT).
+		SubmitNotes::NoteExternal(SubmitNotes::g_dlss, reinterpret_cast<uint64_t>(semaphore), wait_value, signal_value);
 		{
 			Common::LockGuard lock(graphics.queue_mutex);
 			submitted = VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(graphics.queue), 1, &submit,
 			                                                        VK_NULL_HANDLE);
 		}
+		Dlss5::InputsSubmitted(submitted == VK_SUCCESS);
 		if (submitted != VK_SUCCESS) {
 			Fail("vkQueueSubmit");
 			return Result::NotQueued;
@@ -859,6 +870,7 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
 	if (ext_result == NVSDK_NGX_Result_Success) {
 		AppendNgxExtensions("device", required, count, available, extensions);
 	}
+	Dlss5::AppendDeviceExtensions(available, extensions);
 #else
 	(void)instance;
 	(void)physical;

@@ -91,6 +91,138 @@ static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBi
 	return prepared;
 }
 
+// KYTY_META_CLEAR_STRICT=0 restores the old rule: any written buffer that starts at a registered metadata
+// surface makes the whole dispatch a metadata clear.
+static bool MetaClearStrict() {
+	static const bool strict = [] {
+		const char* value = std::getenv("KYTY_META_CLEAR_STRICT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return strict;
+}
+
+// KYTY_META_CLEAR_COVER=0: a metadata clear needs no fill proof and need not cover a whole layer.
+static bool MetaClearCover() {
+	static const bool cover = [] {
+		const char* value = std::getenv("KYTY_META_CLEAR_COVER");
+		return value == nullptr || value[0] != '0';
+	}();
+	return cover;
+}
+
+// NHL27METACLEAR: once per shader, verdict and written size (at most 160 lines), and the count of kept dispatches
+// at each power of 2, so a run log shows that the rule was exercised.
+[[gnu::noinline]] static void NoteMetaClear(TextureCache& cache, const ShaderComputeInputInfo& input, uint32_t verdict,
+                                            uint32_t written, uint32_t meta, uint32_t images_written, uint64_t base,
+                                            uint64_t bytes) {
+	static constexpr const char* names[] = {"consumed", "kept-mixed", "kept-partial", "kept-not-fill",
+	                                        "marked-oversize"};
+	const auto&                  program = *input.stage.program;
+	const auto&                  fill    = input.stage.resources->uniform_fill;
+	static std::atomic<uint64_t> kept {0};
+	const uint64_t               count = verdict == 0 ? 0 : kept.fetch_add(1, std::memory_order_relaxed) + 1;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	bool                                first = false;
+	{
+		std::scoped_lock lock {mutex};
+		first = seen.size() < 160 &&
+		        seen.insert((program.shader_hash ^ (bytes * 0x9e3779b97f4a7c15ull)) * 8u + verdict).second;
+	}
+	if (first) {
+		uint64_t meta_bytes = 0;
+		uint32_t layers     = 0;
+		bool     alive      = false;
+		(void)cache.GetMetaInfo(base, &meta_bytes, &layers, &alive);
+		std::printf("NHL27METACLEAR: shader=0x%016llx %s written=%u meta=%u images_written=%u buf=0x%llx bytes=0x%llx "
+		            "meta_bytes=0x%llx layers=%u owner=%s fill=%d/%u/%u/0x%x\n",
+		            static_cast<unsigned long long>(program.shader_hash), names[verdict], written, meta, images_written,
+		            static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes),
+		            static_cast<unsigned long long>(meta_bytes), layers, alive ? "alive" : "gone",
+		            static_cast<int>(fill.kind), static_cast<unsigned>(fill.resource), static_cast<unsigned>(fill.words),
+		            static_cast<unsigned>(fill.value));
+		std::fflush(stdout);
+	}
+	if (count != 0 && (count & (count - 1)) == 0) {
+		std::printf("NHL27METACLEAR: kept %llu dispatch(es) that are not metadata clears (last shader 0x%016llx "
+		            "%s); they run on the GPU\n",
+		            static_cast<unsigned long long>(count), static_cast<unsigned long long>(program.shader_hash),
+		            names[verdict]);
+		std::fflush(stdout);
+	}
+}
+
+// Buffer `index` is the next written buffer of a dispatch without address math (no bitwise xor). Returns true if
+// the dispatch is a metadata clear; it then marks every written metadata surface as cleared. A metadata clear is a
+// proven uniform fill of metadata only: every written buffer starts at a registered metadata surface, is the
+// shader's proven fill target and covers at least one whole layer of a surface whose owner image is alive but not
+// more than the surface, and no image is written. The game's frame-graph pool reuses a depth target's HTile memory
+// for other data while the image stays cached, so a base-address match alone also caught real work: NHL 27's
+// light-args writer 4b2ca96a (dispatch and draw args 0x400 apart), the binning shader c5195a5e and computed-data
+// writers of 0x20-0x15c00 bytes over a 0x8000-byte HTile. The light draw then read garbage args ("lights off", GPU
+// hang), and the depth target was cleared at its next use. A proven fill larger than the surface (a pool clear of
+// 0x60000-0xff000 bytes at a layout change) marks the surface as cleared, as before, but still runs, so the memory
+// after the surface gets its values.
+[[gnu::noinline]] static bool ConsumeMetaClearAt(const ShaderComputeInputInfo& input, TextureCache& cache,
+                                                 uint32_t index, uint64_t base) {
+	if (!cache.IsMeta(base)) {
+		return false;
+	}
+	if (!MetaClearStrict()) {
+		return cache.ClearMeta(base);
+	}
+	const auto& program        = *input.stage.program;
+	const auto& resources      = *input.stage.resources;
+	const auto& fill           = resources.uniform_fill;
+	uint32_t    images_written = 0;
+	for (const auto& image: program.info.images) images_written += image.written ? 1u : 0u;
+	uint32_t written    = 0;
+	uint32_t meta       = 0;
+	uint32_t first_meta = UINT32_MAX;
+	uint32_t verdict    = 0;
+	bool     oversize   = false;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) continue;
+		written++;
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		uint64_t   meta_bytes = 0;
+		uint32_t   layers     = 0;
+		bool       alive      = false;
+		if (!cache.GetMetaInfo(descriptor.Base48(), &meta_bytes, &layers, &alive)) continue;
+		meta++;
+		first_meta = std::min(first_meta, i);
+		if (verdict == 0 && MetaClearCover()) {
+			if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || fill.resource != i) {
+				verdict = 3;
+			} else if (!cache.MetaCovered(descriptor.Base48(), descriptor.GetSize())) {
+				verdict = 2;
+			} else if (descriptor.GetSize() > meta_bytes) {
+				oversize = true;
+			}
+		}
+	}
+	// The caller asks for each written buffer in order: decide once, at the first metadata buffer.
+	if (index != first_meta) {
+		return false;
+	}
+	if (meta != written || images_written != 0) {
+		verdict = 1;
+	}
+	if (verdict == 0) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (program.info.buffers[i].written) {
+				(void)cache.ClearMeta(DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]).Base48());
+			}
+		}
+		if (oversize) {
+			verdict = 4;
+		}
+	}
+	NoteMetaClear(cache, input, verdict, written, meta, images_written, base,
+	              DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[index]).GetSize());
+	return verdict == 0;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
@@ -115,7 +247,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				if (ConsumeMetaClearAt(input, cache, i, descriptor.Base48())) {
 					return true;
 				}
 			}

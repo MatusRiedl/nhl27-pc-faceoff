@@ -81,6 +81,22 @@ private:
 	std::unique_ptr<Impl> m_impl;
 };
 
+// Windows commit charge (zeros elsewhere or when the query fails): the system's commit in use and
+// limit (RAM plus paging files), and this process's private commit, in bytes.
+struct CommitCharge {
+	uint64_t system_used  = 0;
+	uint64_t system_limit = 0;
+	uint64_t process      = 0;
+};
+[[nodiscard]] CommitCharge GetCommitCharge() noexcept;
+
+// NHL27OOM: an allocation of requested_bytes failed; prints the commit charge and what to do.
+void PrintOutOfCommit(const char* where, uint64_t requested_bytes) noexcept;
+
+// NHL27POWER (KYTY_POWER_THROTTLING_OPTOUT, default 1): asks Windows never to power-throttle this
+// process (EcoQoS while the window is unfocused or covered, ignored timer resolution).
+void OptOutOfPowerThrottling() noexcept;
+
 } // namespace Common
 
 #endif /* KYTY_COMMON_HOST_STATS_H_ */

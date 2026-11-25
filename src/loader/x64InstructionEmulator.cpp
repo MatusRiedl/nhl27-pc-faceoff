@@ -5,6 +5,7 @@
 #include <Zydis/Zydis.h>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -583,6 +584,48 @@ static bool TryEmulateShaNi(Context& context) {
 
 #endif
 
+static bool EnvFlagOn(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+bool ForceSse4aTrap() noexcept {
+#if defined(KYTY_SSE4A_TRAP_DIAG)
+	static const bool enabled = EnvFlagOn("KYTY_FORCE_SSE4A_TRAP");
+	return enabled;
+#else
+	// Shipping builds: the guest patcher keeps its PGO profile (guestInstructionPatcher.cpp,
+	// ApplyForcedSse4aTrap). Say so once if someone sets the switch anyway.
+	static const bool noted = [] {
+		if (EnvFlagOn("KYTY_FORCE_SSE4A_TRAP")) {
+			std::printf("KYTY_FORCE_SSE4A_TRAP: ignored, needs a diagnostic build (CMake KYTY_SSE4A_TRAP_DIAG)\n");
+			std::fflush(stdout);
+		}
+		return true;
+	}();
+	static_cast<void>(noted);
+	return false;
+#endif
+}
+
+// The SSE4a opcode byte behind a site the patcher marked (KYTY_FORCE_SSE4A_TRAP); other bytes come back
+// unchanged. Kept out of TryEmulateSse4a so its profile keeps its shape.
+[[gnu::noinline]] static uint8_t UnmarkSse4aOpcode(uint8_t opcode) {
+	if (!ForceSse4aTrap()) {
+		return opcode;
+	}
+	return opcode == Sse4aTrapImmediateOpcode  ? uint8_t {0x78}
+	       : opcode == Sse4aTrapRegisterOpcode ? uint8_t {0x79}
+	                                           : opcode;
+}
+
+// Mask for the upper quadword of an emulated INSERTQ: all ones keeps it (the default), zero clears it
+// (KYTY_INSERTQ_CLEAR_HIGH=1).
+[[gnu::noinline]] static uint64_t InsertqHighMask() {
+	static const uint64_t mask = EnvFlagOn("KYTY_INSERTQ_CLEAR_HIGH") ? 0 : UINT64_MAX;
+	return mask;
+}
+
 static bool TryEmulateSse4a(Context& context) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
 	const uint8_t prefix = rip[0];
@@ -598,8 +641,9 @@ static bool TryEmulateSse4a(Context& context) {
 	if (rip[offset] != 0x0f) {
 		return false;
 	}
-	const bool register_form = rip[offset + 1] == 0x79;
-	if (rip[offset + 1] != 0x78 && !register_form) {
+	const uint8_t opcode        = UnmarkSse4aOpcode(rip[offset + 1]);
+	const bool    register_form = opcode == 0x79;
+	if (opcode != 0x78 && !register_form) {
 		return false;
 	}
 
@@ -643,6 +687,7 @@ static bool TryEmulateSse4a(Context& context) {
 		dest[1] = 0;
 	} else {
 		dest[0] = InsertBitField(dest[0], source[0], length, index);
+		dest[1] &= InsertqHighMask();
 	}
 	std::memcpy(dest_xmm, dest, sizeof(dest));
 	context.Advance(instruction_length);

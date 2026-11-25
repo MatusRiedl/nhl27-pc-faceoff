@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/hostStats.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -172,6 +173,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		printf("Buffer: retry %s (%s)\n", result == vk::Result::eSuccess ? "succeeded" : "failed",
 		       step);
 		if (result != vk::Result::eSuccess) {
+			// Over-budget video memory is paged into system memory, so the commit charge matters too.
+			// Before LogMemoryBudget and noexcept: a plain call in the same block keeps this
+			// constructor's CFG (and its PGO profile) as it was.
+			Common::PrintOutOfCommit("Vulkan buffer", size);
 			graphics.LogMemoryBudget();
 		}
 		fflush(stdout);

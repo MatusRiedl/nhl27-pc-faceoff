@@ -3,6 +3,8 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/freezeDump.h"
+#include "common/hostStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
@@ -18,12 +20,14 @@
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/dlss5Pass.h"
 #include "graphics/presentation/fsr/frameGen.h"
 #include "graphics/presentation/fsr/fsr1.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/presentRect.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -44,6 +48,39 @@
 
 namespace Libs::Graphics {
 
+// KYTY_MINIMIZE_GUARD (default 1): while the window is minimized, no swapchain is made for the 0x0
+// surface and frames are not presented. 0 = v0.30.0.
+static bool MinimizeGuard() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MINIMIZE_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The no-swapchain line, at the 1st, 2nd, 4th, 8th... time: Present retries Create every frame
+// while the surface stays 0x0. Out of line and noexcept: Create keeps its CFG (one plain call).
+[[gnu::noinline]] static void PrintNoSwapchain(uint32_t width, uint32_t height) noexcept {
+	static std::atomic<uint64_t> count {0};
+	const uint64_t               n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n & (n - 1)) == 0) {
+		std::printf("NHL27MINIMIZE: no swapchain while the surface is %ux%u (n=%llu)\n", width, height,
+		            static_cast<unsigned long long>(n));
+		std::fflush(stdout);
+	}
+}
+
+// NHL27DEVLOST: the device was lost under a present call. ReportDeviceLost prints the breadcrumbs and
+// VK_EXT_device_fault data before the EXIT that follows (it only ran for semaphore waits before).
+static void ReportIfDeviceLost(GraphicContext& graphics, vk::Result result, const char* call) {
+	if (result != vk::Result::eErrorDeviceLost) {
+		return;
+	}
+	std::printf("NHL27DEVLOST: %s returned VK_ERROR_DEVICE_LOST\n", call);
+	std::fflush(stdout);
+	ReportDeviceLost(graphics);
+}
+
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
@@ -51,6 +88,7 @@ struct Presenter::Frame {
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
+	uint64_t      serial       = 0; // a new value with every picture copied or cleared into it
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(CommandRecorder command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -248,7 +286,10 @@ void Presenter::Frame::Transit(CommandRecorder command, vk::ImageLayout layout,
 	image.subresource_states.clear();
 }
 
+static std::atomic<uint64_t> g_picture_serial {0};
+
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
+	serial = g_picture_serial.fetch_add(1, std::memory_order_relaxed) + 1;
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
@@ -265,6 +306,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
+	serial = g_picture_serial.fetch_add(1, std::memory_order_relaxed) + 1;
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
@@ -293,6 +335,9 @@ public:
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
 	}
+	// KYTY_MINIMIZE_GUARD: the window is minimized and Windows reports a 0x0 surface, so this
+	// frame is not presented (the guest flip still completes, like a dropped frame).
+	[[nodiscard]] bool SkipWhileMinimized();
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
@@ -466,6 +511,12 @@ void Swapchain::Create() {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
 	}
+	// Minimized on Windows: currentExtent is 0x0 and no swapchain can be made. Stay without one
+	// (ImageCount() == 0, so Present retries) until the window has a size again (upstream a2ea94e9).
+	if (MinimizeGuard() && (m_extent.width == 0 || m_extent.height == 0)) {
+		PrintNoSwapchain(m_extent.width, m_extent.height);
+		return;
+	}
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -629,6 +680,25 @@ void Swapchain::Destroy() {
 	m_render_complete.clear();
 }
 
+bool Swapchain::SkipWhileMinimized() {
+	static bool  skipping = false;
+	bool         skip     = false;
+	vk::Extent2D extent {};
+	if (MinimizeGuard() && Common::FreezeDump::IsMinimized()) {
+		// The flag alone could be stale (a missed restore event): skip only while the surface is 0x0.
+		m_window.RefreshSurfaceCapabilities();
+		extent = m_window.surface_capabilities.capabilities.currentExtent;
+		skip   = extent.width == 0 || extent.height == 0;
+	}
+	if (skip != skipping) {
+		skipping = skip;
+		std::printf("NHL27MINIMIZE: presentation %s (surface %ux%u)\n", skip ? "paused" : "running",
+		            extent.width, extent.height);
+		std::fflush(stdout);
+	}
+	return skip;
+}
+
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
@@ -674,7 +744,9 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			ReportIfDeviceLost(m_window.graphic_ctx, result, "vkAcquireNextImageKHR");
+			EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
@@ -817,6 +889,43 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	command.endRendering();
 }
 
+// DLSS 5 (KYTY_DLSS5=1, dlss5Pass.h): the player's own model on the presented picture. Nothing
+// unless the switch is on; a null image means present the source as before.
+[[gnu::noinline]] static Dlss5::PresentResult RecordDlss5(CommandBuffer& command, Presenter::Frame& source,
+                                                          bool hdr_active, vk::Format target, vk::Extent2D box,
+                                                          GraphicContext& graphics) {
+	if (!Dlss5::Active()) {
+		return {};
+	}
+	auto vk_command = command.Handle();
+	source.Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+	Dlss5::PresentSource input;
+	input.image         = static_cast<VkImage>(source.image.image);
+	input.format        = static_cast<VkFormat>(source.image.format);
+	input.extent        = VkExtent2D {source.image.extent.width, source.image.extent.height};
+	input.serial        = source.serial;
+	input.hdr           = source.hdr || hdr_active;
+	input.blank         = source.blank;
+	input.target_format = static_cast<VkFormat>(target);
+	input.box           = VkExtent2D {box.width, box.height};
+	const auto result  = Dlss5::RecordPresent(graphics, static_cast<VkCommandBuffer>(vk_command.Direct()), input);
+	if (result.image != VK_NULL_HANDLE) {
+		// The model's commands leave pipeline and dynamic state undefined for the overlay draw.
+		command.InvalidateDynamicState();
+	}
+	return result;
+}
+
+// DLSS 5 ran on this picture, so the sharpening pass did not: say so (Faceoff reads the last status).
+[[gnu::noinline]] static void NoteFsr1SkippedForDlss5(std::string& status) {
+	static const std::string skipped = "skipped (DLSS 5 ran instead)";
+	if (status != skipped) {
+		std::printf("NHL27FSR version=1 status=%s\n", skipped.c_str());
+		std::fflush(stdout);
+		status = skipped;
+	}
+}
+
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
@@ -845,13 +954,21 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			m_content_status = std::move(status);
 		}
 	}
+	// DLSS 5 works at the image's box size (or the picture's): its result is blitted from its own size.
+	const auto dlss5 = source != nullptr
+	                       ? RecordDlss5(command, *source, m_hdr_active, m_format, content_extent, m_window.graphic_ctx)
+	                       : Dlss5::PresentResult {};
+	if (dlss5.image != VK_NULL_HANDLE) {
+		blit_source = dlss5.image;
+		blit_extent = vk::Extent2D {dlss5.extent.width, dlss5.extent.height};
+	}
 	const bool fsr1_enabled = Common::RuntimeFlags::Current().fsr1;
 	if (!fsr1_enabled && !m_fsr1_status.empty()) {
 		std::printf("NHL27FSR version=1 status=disabled\n");
 		std::fflush(stdout);
 		m_fsr1_status.clear();
 	}
-	if (source && fsr1_enabled) {
+	if (source && fsr1_enabled && dlss5.image == VK_NULL_HANDLE) {
 		const bool sdr_format = source->image.format == vk::Format::eR8G8B8A8Unorm ||
 		                        source->image.format == vk::Format::eB8G8R8A8Unorm ||
 		                        source->image.format == vk::Format::eA2B10G10R10UnormPack32 ||
@@ -904,6 +1021,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			std::fflush(stdout);
 			m_fsr1_status = std::move(status);
 		}
+	} else if (source && fsr1_enabled) {
+		NoteFsr1SkippedForDlss5(m_fsr1_status);
 	}
 	if (source != nullptr) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
@@ -1056,7 +1175,9 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			ReportIfDeviceLost(m_window.graphic_ctx, result, "vkQueuePresentKHR");
+			EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 	return Status::Success;
@@ -1191,6 +1312,23 @@ struct PresentCapture {
 // every 5 s NHL27FRAMETIME prints the average and the 1% / 0.1% low fps plus the longest frame,
 // and each frame longer than 40 ms prints NHL27HITCH (t = seconds, as in NHL27FPS t=). miss_ms sums how far
 // the frames over 40 ms ran past a 30 Hz frame (33.3 ms): the time lost to missed vblanks.
+// NHL27GUESTMEM (with NHL27MEM, every 30 s): guest memory the game holds (direct, pool, extended,
+// mapped, flexible), the largest direct total seen at these samples, and the Windows commit charge.
+// For sizing a lazy guest-memory commit: how much of the up-front commit the game really uses.
+static void PrintGuestMemoryLine() {
+	static uint64_t peak_direct = 0;
+	const auto      guest       = LibKernel::Memory::GetDebugStats();
+	const auto      commit      = Common::GetCommitCharge();
+	const uint64_t  direct      = guest.direct_allocated + guest.pooled_allocated + guest.automatic_allocated;
+	peak_direct                 = std::max(peak_direct, direct);
+	const auto mb               = [](uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
+	std::printf("NHL27GUESTMEM direct_mb=%llu pooled_mb=%llu extended_mb=%llu mapped_mb=%llu of=%llu "
+	            "flexible_mb=%llu of=%llu peak_direct_mb=%llu commit_mb=%llu limit_mb=%llu process_mb=%llu\n",
+	            mb(guest.direct_allocated), mb(guest.pooled_allocated), mb(guest.automatic_allocated),
+	            mb(guest.direct_mapped), mb(guest.direct_total), mb(guest.flexible_used), mb(guest.flexible_total),
+	            mb(peak_direct), mb(commit.system_used), mb(commit.system_limit), mb(commit.process));
+}
+
 static void TrackPresentInterval(const GraphicContext& graphics) {
 	static std::vector<float> window_ms;
 	static auto               last         = std::chrono::steady_clock::now();
@@ -1233,6 +1371,7 @@ static void TrackPresentInterval(const GraphicContext& graphics) {
 	            1000.0 * static_cast<double>(sorted.size()) / span_ms, low_fps(0.01), low_fps(0.001),
 	            static_cast<double>(sorted.front()), static_cast<long long>(over(20.0f)), static_cast<long long>(over(34.0f)),
 	            static_cast<long long>(over(50.0f)), static_cast<long long>(over(40.0f)), miss_ms);
+	BufferCachePrintReadWaits();
 	// NHL27MEM every 30 s: video memory in use against the budget, and the buffer cache's game
 	// buffers (count, bytes, largest created since the last line, out-of-memory retries), to tell
 	// a leak (bytes keep rising) from one oversized buffer.
@@ -1248,6 +1387,7 @@ static void TrackPresentInterval(const GraphicContext& graphics) {
 		            static_cast<unsigned long long>(stats.buffers), static_cast<unsigned long long>(stats.bytes >> 20u),
 		            static_cast<unsigned long long>(stats.largest >> 20u),
 		            static_cast<unsigned long long>(stats.retries));
+		PrintGuestMemoryLine();
 	}
 	std::fflush(stdout);
 	window_ms.clear();
@@ -1364,9 +1504,18 @@ void Presenter::Impl::Present() {
 	const auto* main_frame = layers[0].frame;
 	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
 	                         swapchain.SetHdr(main_frame->hdr);
-	// Some window systems keep presenting an old swapchain after a resize.
-	if (hdr_changed || swapchain.NeedsResize()) {
+	// Minimized (0x0 surface): no present and no swapchain recreate every frame.
+	if (swapchain.SkipWhileMinimized()) {
+		return;
+	}
+	// Some window systems keep presenting an old swapchain after a resize. No swapchain images:
+	// Create skipped the swapchain while the surface was 0x0 (only with KYTY_MINIMIZE_GUARD), try again.
+	if (hdr_changed || swapchain.NeedsResize() || swapchain.ImageCount() == 0) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
+	}
+	// Still no swapchain (the surface is 0x0): drop this frame.
+	if (swapchain.ImageCount() == 0) {
+		return;
 	}
 	// Frame generation turning on or off (frameGen.h) recreates the swapchain in the matching
 	// present mode first; at most twice (the mode can turn back off while it waits).
@@ -1383,6 +1532,10 @@ void Presenter::Impl::Present() {
 		capture_wanted = std::filesystem::remove("present.trigger", error);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		// A recreate above or in the last attempt found a 0x0 surface (AcquireNextImage needs a swapchain).
+		if (swapchain.ImageCount() == 0) {
+			return;
+		}
 		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);

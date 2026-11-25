@@ -156,4 +156,32 @@ inline Nhl27ResetReason ShouldResetHistory(const Nhl27HistoryState* prev, const 
 		return Nhl27ResetReason::JitterMismatch;
 	return Nhl27ResetReason::None;
 }
+// Upscaler size hold (KYTY_UPSCALER_SIZE_HOLD, frames). At a scene change the game puts its own resolution scale
+// back for a frame or two, until the patch thread writes the set scale again. Each new size made the upscaler drain
+// the GPU and build itself again, twice (to the odd size and back): two long frames. Now a frame at a size other
+// than the one the upscaler is built for is left to the game's own pass, up to `limit` frames in a row; only a size
+// that stays longer rebuilds the upscaler. limit 0 = rebuild at once (the behaviour before).
+struct Nhl27SizeHold {
+	enum class Action { Take, Hold, Rebuild };
+	using Size = std::array<uint32_t, 4>; // render width, height, output width, height
+	uint32_t limit = 0;
+	uint32_t held  = 0; // frames held in a row so far
+	uint32_t ended = 0; // set by Decide: frames held by a hold that ended on this call (0 = none ended)
+	// `live` is the size the upscaler is built for, or null when it is not built yet.
+	Action Decide(const Size& size, const Size* live) {
+		ended = 0;
+		if (live == nullptr || size == *live) {
+			ended = held;
+			held  = 0;
+			return Action::Take;
+		}
+		if (held >= limit) {
+			ended = held;
+			held  = 0;
+			return Action::Rebuild;
+		}
+		++held;
+		return Action::Hold;
+	}
+};
 } // namespace Libs::Graphics

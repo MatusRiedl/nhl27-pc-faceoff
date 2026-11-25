@@ -177,6 +177,78 @@ void NoteCpuCrumb(const char* kind, uint64_t hash_a, uint64_t hash_b, uint64_t i
 	g_cpu_crumbs[n % g_cpu_crumbs.size()] = {kind, hash_a, hash_b, info, g_crumb_master->CurrentTick()};
 }
 
+// The commands of each recent render tick, copied when the tick is submitted. The ring above
+// holds about a frame, so a long GPU hang outlives it: B30 (2026-11-22) had the GPU at tick 280234
+// and the ring starting at 280256, so the ticks the GPU hung in were gone. One copy per submitted
+// tick (QueueSubmit), not per command; at most kHeadCrumbs commands per tick.
+constexpr size_t kHeadTicks  = 128;
+constexpr size_t kHeadCrumbs = 256;
+struct TickHead {
+	std::atomic<uint64_t>             tick {0};
+	uint32_t                          saved = 0;
+	uint32_t                          total = 0;
+	std::array<CpuCrumb, kHeadCrumbs> crumbs {};
+};
+std::array<TickHead, kHeadTicks> g_tick_heads;
+uint64_t                         g_head_scan = 0;
+
+// Called by every scheduler's QueueSubmit (one plain call, no new branch there); only the render
+// scheduler's ticks are the ones the crumbs carry.
+[[gnu::noinline]] void SaveTickHead(const MasterSemaphore* master, uint64_t tick) noexcept {
+	if (master != g_crumb_master || g_crumb_master == nullptr) {
+		return;
+	}
+	const uint64_t next   = g_cpu_crumb_next.load(std::memory_order_relaxed);
+	const uint64_t oldest = next > g_cpu_crumbs.size() ? next - g_cpu_crumbs.size() : 0;
+	auto&          head   = g_tick_heads[tick % kHeadTicks];
+	head.tick.store(0, std::memory_order_relaxed);
+	uint32_t saved = 0;
+	uint32_t total = 0;
+	for (uint64_t n = std::max(g_head_scan, oldest); n < next; n++) {
+		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
+		if (c.kind == nullptr || c.tick != tick) {
+			continue;
+		}
+		total++;
+		if (saved < kHeadCrumbs) {
+			head.crumbs[saved++] = c;
+		}
+	}
+	g_head_scan = next;
+	head.saved  = saved;
+	head.total  = total;
+	head.tick.store(tick, std::memory_order_release);
+}
+
+// NHL27HANGHEAD: every saved command of the oldest unfinished tick, then one line per later one.
+void PrintTickHeads(uint64_t known, bool known_valid) {
+	std::array<uint64_t, kHeadTicks> ticks {};
+	size_t                           count = 0;
+	for (const auto& head: g_tick_heads) {
+		const uint64_t tick = head.tick.load(std::memory_order_acquire);
+		if (tick != 0 && (!known_valid || tick > known)) {
+			ticks[count++] = tick;
+		}
+	}
+	std::sort(ticks.begin(), ticks.begin() + static_cast<std::ptrdiff_t>(count));
+	std::printf("NHL27HANGHEAD: %zu unfinished ticks saved%s\n", count,
+	            known_valid ? "" : " (finished tick unknown: all saved ticks)");
+	for (size_t i = 0; i < count; i++) {
+		const auto& head = g_tick_heads[ticks[i] % kHeadTicks];
+		std::printf("NHL27HANGHEAD: tick %llu commands=%u saved=%u\n", static_cast<unsigned long long>(ticks[i]),
+		            head.total, head.saved);
+		if (i != 0) {
+			continue;
+		}
+		for (uint32_t k = 0; k < head.saved && k < kHeadCrumbs; k++) {
+			const auto& c = head.crumbs[k];
+			std::printf("NHL27HANGHEAD:   #%u %s a=0x%016llx b=0x%016llx info=0x%llx\n", k,
+			            c.kind != nullptr ? c.kind : "?", static_cast<unsigned long long>(c.hash_a),
+			            static_cast<unsigned long long>(c.hash_b), static_cast<unsigned long long>(c.info));
+		}
+	}
+}
+
 void DumpCpuCrumbs() {
 	if (g_crumb_master == nullptr) {
 		return;
@@ -218,12 +290,16 @@ void DumpCpuCrumbs() {
 		}
 		index++;
 	}
+	PrintTickHeads(known, known_valid);
 	std::fflush(stdout);
 }
 
 // NHL26 debugging: after a device loss, print what VK_EXT_device_fault reports (faulting GPU
 // addresses and vendor fault codes). No-op when the extension is not enabled.
 void DumpDeviceFault(vk::Device device) {
+	// The submissions and the semaphore values they wait for (the freeze report prints the same;
+	// a device loss exits before the freeze watchdog fires).
+	CommandScheduler::PrintFreezeSubmits();
 	DumpCpuCrumbs();
 	DumpBreadcrumbs();
 	const auto get_fault_info = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
@@ -1115,6 +1191,145 @@ size_t CommandScheduler::CommandPool::Acquire(uint64_t busy_until) {
 	return *found;
 }
 
+namespace {
+
+// Freeze report (submitNotes.h): the schedulers whose submissions it lists. 0 = the render
+// scheduler, 1 = the presenter's.
+std::array<std::atomic<CommandScheduler*>, 2> g_note_schedulers {};
+
+// Out of line and noexcept: the constructor and destructor gain one plain call each.
+[[gnu::noinline]] void RegisterSubmitNotes(CommandScheduler* scheduler, bool render) noexcept {
+	g_note_schedulers[render ? 0 : 1].store(scheduler, std::memory_order_release);
+}
+
+[[gnu::noinline]] void UnregisterSubmitNotes(CommandScheduler* scheduler) noexcept {
+	for (auto& slot: g_note_schedulers) {
+		CommandScheduler* expected = scheduler;
+		slot.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+	}
+}
+
+// The value of a timeline semaphore now, UINT64_MAX when unknown. SEH: a stale handle must not
+// take the process down before the freeze dump is written.
+[[gnu::noinline]] uint64_t SemaphoreValueNow(VkDevice device, uint64_t semaphore) noexcept {
+	uint64_t value = UINT64_MAX;
+	if (semaphore == 0 || device == VK_NULL_HANDLE) {
+		return value;
+	}
+#if defined(_WIN32)
+	__try {
+		if (vk::Device(device).getSemaphoreCounterValue(vk::Semaphore(reinterpret_cast<VkSemaphore>(semaphore)),
+		                                                &value) != vk::Result::eSuccess) {
+			value = UINT64_MAX;
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		value = UINT64_MAX;
+	}
+#endif
+	return value;
+}
+
+uint64_t SemaphoreBits(vk::Semaphore semaphore) noexcept {
+	return reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(semaphore));
+}
+
+// Stores only, no branches (QueueSubmit keeps its PGO profile).
+[[gnu::always_inline]] inline void NoteSubmit(SubmitNotes::Ring& ring, const SubmitInfo& submit,
+                                              uint64_t tick) noexcept {
+	auto& note = ring.notes[tick % SubmitNotes::kRing];
+	note.wait_semaphore[0].store(SemaphoreBits(submit.wait_semaphores[0]), std::memory_order_relaxed);
+	note.wait_value[0].store(submit.wait_ticks[0], std::memory_order_relaxed);
+	note.wait_semaphore[1].store(SemaphoreBits(submit.wait_semaphores[1]), std::memory_order_relaxed);
+	note.wait_value[1].store(submit.wait_ticks[1], std::memory_order_relaxed);
+	note.signal_semaphore.store(SemaphoreBits(submit.signal_semaphores[0]), std::memory_order_relaxed);
+	note.signal_value.store(submit.signal_ticks[0], std::memory_order_relaxed);
+	note.counts.store(submit.num_wait_semaphores | (submit.num_signal_semaphores << 8u), std::memory_order_relaxed);
+	note.tick.store(tick, std::memory_order_release);
+}
+
+void FormatSemaphore(char* text, size_t size, uint64_t semaphore, uint64_t value, uint64_t master,
+                     uint64_t dlss, VkDevice device) noexcept {
+	char name[24];
+	if (semaphore == master) {
+		std::snprintf(name, sizeof(name), "master");
+	} else if (semaphore != 0 && semaphore == dlss) {
+		std::snprintf(name, sizeof(name), "dlss");
+	} else {
+		std::snprintf(name, sizeof(name), "0x%llx", static_cast<unsigned long long>(semaphore & 0xffffffffu));
+	}
+	// Binary semaphores (the swapchain's) are used with value 0 or 1; only timelines have a value.
+	if (value < 2) {
+		std::snprintf(text, size, "%s:binary", name);
+		return;
+	}
+	const uint64_t now = SemaphoreValueNow(device, semaphore);
+	if (now == UINT64_MAX) {
+		std::snprintf(text, size, "%s:%llu(now ?)", name, static_cast<unsigned long long>(value));
+	} else {
+		std::snprintf(text, size, "%s:%llu(now %llu)", name, static_cast<unsigned long long>(value),
+		              static_cast<unsigned long long>(now));
+	}
+}
+
+} // namespace
+
+void CommandScheduler::PrintFreezeCommands() noexcept {
+	DumpCpuCrumbs();
+}
+
+void CommandScheduler::PrintFreezeSubmits() noexcept {
+	const uint64_t dlss        = SubmitNotes::g_dlss.semaphore.load(std::memory_order_relaxed);
+	VkDevice       dlss_device = VK_NULL_HANDLE;
+	for (size_t slot = 0; slot < g_note_schedulers.size(); slot++) {
+		const CommandScheduler* scheduler = g_note_schedulers[slot].load(std::memory_order_acquire);
+		if (scheduler == nullptr) {
+			continue;
+		}
+		const auto     device = static_cast<VkDevice>(scheduler->m_graphics.device);
+		dlss_device           = dlss_device == VK_NULL_HANDLE ? device : dlss_device;
+		const uint64_t master = SemaphoreBits(scheduler->m_master.Handle());
+		const uint64_t value  = SemaphoreValueNow(device, master);
+		const uint64_t known  = scheduler->m_master.KnownGpuTick();
+		const uint64_t done   = value != UINT64_MAX ? value : known;
+		const char*    name   = slot == 0 ? "render" : "present";
+		std::printf("NHL27SUBMIT: sched=%s deferred=%d next=%llu submitted=%llu known=%llu value=%lld\n", name,
+		            scheduler->m_deferred ? 1 : 0, static_cast<unsigned long long>(scheduler->m_master.CurrentTick()),
+		            static_cast<unsigned long long>(scheduler->m_submitted_tick.load(std::memory_order_acquire)),
+		            static_cast<unsigned long long>(known), value == UINT64_MAX ? -1LL : static_cast<long long>(value));
+		// The last finished submission, then the unfinished ones in tick order.
+		for (uint64_t tick = done; tick < done + SubmitNotes::kRing; tick++) {
+			const auto& note = scheduler->m_submit_notes.notes[tick % SubmitNotes::kRing];
+			if (tick == 0 || note.tick.load(std::memory_order_acquire) != tick) {
+				continue;
+			}
+			const uint32_t counts  = note.counts.load(std::memory_order_relaxed);
+			const uint32_t waits   = counts & 0xffu;
+			const uint32_t signals = (counts >> 8u) & 0xffu;
+			char           wait_text[2][64] {};
+			for (uint32_t i = 0; i < 2 && i < waits; i++) {
+				FormatSemaphore(wait_text[i], sizeof(wait_text[i]), note.wait_semaphore[i].load(std::memory_order_relaxed),
+				                note.wait_value[i].load(std::memory_order_relaxed), master, dlss, device);
+			}
+			char signal_text[64] {};
+			FormatSemaphore(signal_text, sizeof(signal_text), note.signal_semaphore.load(std::memory_order_relaxed),
+			                note.signal_value.load(std::memory_order_relaxed), master, dlss, device);
+			std::printf("NHL27SUBMIT: sched=%s tick=%llu %s waits=%u %s %s%s signals=%u first=%s\n", name,
+			            static_cast<unsigned long long>(tick), tick <= done ? "done" : "pending", waits, wait_text[0],
+			            wait_text[1], waits > 2 ? " +more" : "", signals, signal_text);
+		}
+	}
+	const uint64_t count = SubmitNotes::g_dlss.count.load(std::memory_order_relaxed);
+	if (count != 0) {
+		const uint64_t now = SemaphoreValueNow(dlss_device, dlss);
+		std::printf("NHL27SUBMIT: dlss submits=%llu last_wait=%llu last_signal=%llu now=%lld\n",
+		            static_cast<unsigned long long>(count),
+		            static_cast<unsigned long long>(SubmitNotes::g_dlss.wait_value.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(SubmitNotes::g_dlss.signal_value.load(std::memory_order_relaxed)),
+		            now == UINT64_MAX ? -1LL : static_cast<long long>(now));
+	}
+	std::fflush(stdout);
+}
+
 bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
@@ -1130,6 +1345,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 	if (&context.GetCommandScheduler() == this) {
 		g_crumb_master = &m_master;
 	}
+	RegisterSubmitNotes(this, &context.GetCommandScheduler() == this);
 	if (m_deferred) {
 		m_host_copies = std::make_unique<HostCopyQueue>(
 		    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });
@@ -1138,6 +1354,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 }
 
 CommandScheduler::~CommandScheduler() {
+	UnregisterSubmitNotes(this);
 	Shutdown();
 }
 
@@ -1589,6 +1806,8 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 	submit.AddSignal(m_master.Handle(), tick);
+	NoteSubmit(m_submit_notes, submit, tick);
+	SaveTickHead(&m_master, tick);
 
 	vk::TimelineSemaphoreSubmitInfo timeline_info {};
 	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;

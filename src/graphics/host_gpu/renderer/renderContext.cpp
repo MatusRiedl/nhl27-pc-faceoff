@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/freezeDump.h"
 #include "common/hitchWhy.h"
 #include "common/hostException.h"
 #include "common/emulatorConfig.h"
@@ -24,6 +25,39 @@
 
 namespace Libs::Graphics {
 
+namespace {
+
+// The scheduler ticks in the NHL27FREEZE line (atomic reads only: a frozen thread may hold any lock).
+std::atomic<MasterSemaphore*> g_freeze_semaphore {nullptr};
+
+void WriteFreezeState(char* text, size_t size) noexcept {
+	// NHL27SUBMIT lines (the unfinished submissions and what they wait for), before the NHL27FREEZE line.
+	CommandScheduler::PrintFreezeSubmits();
+	CommandScheduler::PrintFreezeCommands();
+	if (const auto* master = g_freeze_semaphore.load(std::memory_order_acquire); master != nullptr) {
+		const uint64_t current = master->CurrentTick();
+		const uint64_t gpu     = master->KnownGpuTick();
+		std::snprintf(text, size, "tick=%llu gpu_tick=%llu behind=%llu", static_cast<unsigned long long>(current),
+		              static_cast<unsigned long long>(gpu),
+		              static_cast<unsigned long long>(current > gpu ? current - gpu : 0));
+	}
+}
+
+// Out of line and noexcept: the constructor and destructor gain one plain call each, not new
+// unwind edges, so their PGO profiles still match.
+[[gnu::noinline]] void SetFreezeStateSource(MasterSemaphore* semaphore) noexcept {
+	if (semaphore == nullptr) {
+		// Waits out a state read the watchdog is doing now, so the scheduler can go after this.
+		Common::FreezeDump::SetStateProvider(nullptr);
+		g_freeze_semaphore.store(nullptr, std::memory_order_release);
+		return;
+	}
+	g_freeze_semaphore.store(semaphore, std::memory_order_release);
+	Common::FreezeDump::SetStateProvider(&WriteFreezeState);
+}
+
+} // namespace
+
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
       m_command_scheduler(*this, graphics,
@@ -42,9 +76,11 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		       LibKernel::Memory::IsReadFaultPage(address, size) &&
 		       LibKernel::Memory::TryReadCleanBufferBacking(address, data, size);
 	});
+	SetFreezeStateSource(&m_command_scheduler.GetMasterSemaphore());
 }
 
 RenderContext::~RenderContext() {
+	SetFreezeStateSource(nullptr);
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }

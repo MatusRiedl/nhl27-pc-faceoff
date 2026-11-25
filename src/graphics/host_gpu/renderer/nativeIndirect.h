@@ -11,14 +11,26 @@ class CommandBuffer;
 class CommandScheduler;
 class Buffer;
 struct NativeIndirectDraw;
-// Mirrors the CP's indexed-count clamp without downloading its argument record.
+// Draw-args guard limit on count x instances of one native indirect record (KYTY_DRAW_GUARD_MAX_WORK,
+// read once; 0: off). Prints the NHL27DRAWGUARD start line on the first call.
+uint32_t NativeIndirectGuardMaxWork() noexcept;
+// Prepares native indirect records on the GPU without downloading them: mirrors the CP's
+// indexed-count clamp, and zeroes records over the draw-args guard limit (see the shader).
 class NativeIndirectPrep {
 public:
- explicit NativeIndirectPrep(GraphicContext& graphics);
+ NativeIndirectPrep(GraphicContext& graphics, CommandScheduler& scheduler);
  ~NativeIndirectPrep();
  void Record(CommandBuffer& buffer, const NativeIndirectDraw& source);
 private:
+ void Report();
  GraphicContext& m_graphics;
+ // Host-visible guard report written by the shader (layout in gpu_tiler_native_indirect.comp).
+ std::unique_ptr<Buffer> m_report;
+ uint32_t m_max_work = 0;
+ uint32_t m_reported_trips = 0;
+ uint32_t m_reported_max = 0;
+ uint64_t m_calls = 0;
+ uint64_t m_max_printed_at = 0;
  vk::PipelineLayout m_layout = nullptr;
  vk::Pipeline m_pipeline = nullptr;
 };
@@ -41,6 +53,8 @@ private:
  std::unique_ptr<Buffer> m_trips;
  uint32_t m_reported_trips = 0;
  uint64_t m_next = 0;
+ // Group-count product above which a record is zeroed (KYTY_DISPATCH_GUARD_MAX_GROUPS, read once).
+ uint32_t m_max_groups = 1u << 22u;
  vk::PipelineLayout m_layout = nullptr;
  vk::Pipeline m_pipeline = nullptr;
 };

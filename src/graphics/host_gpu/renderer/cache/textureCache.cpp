@@ -58,6 +58,23 @@ namespace {
 	return enabled;
 }
 
+// Upstream KytyPS5 PR #2417: a cached depth image shorter than the depth target the game binds is
+// recreated too, not only a narrower one (the render area follows the request either way).
+// KYTY_DEPTH_GROW_HEIGHT=0 keeps the v0.30.0 width-only rule. Out of line and noexcept, so
+// DepthOverlapNeedsRecreate gains one plain call and no branch: its CFG, and so its PGO profile,
+// stays the same.
+// The replacement takes the requested extent, so a request that is taller but narrower than the
+// cached image keeps the v0.30.0 reuse: recreating it would shrink the width, and the next wider
+// target would recreate it back, every frame.
+[[nodiscard]] [[gnu::noinline]] bool DepthHeightTooShort(const ImageInfo& cached, const ImageInfo& requested) noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEPTH_GROW_HEIGHT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && cached.extent.height < requested.extent.height &&
+	       cached.extent.width <= requested.extent.width;
+}
+
 [[nodiscard]] bool StencilOwnPlane() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_STENCIL_OWN_PLANE");
@@ -307,6 +324,7 @@ static bool ImageChurnLogLine() {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	const Common::HitchWhy::Span span(Common::HitchWhy::Cause::Image);
 	BufferCache::PerfCount(BufferCache::PerfEvent::ImageInsert);
 	if (ImageChurnLogLine()) {
 		std::printf("NHL27IMAGE: insert addr=0x%llx size=0x%llx fmt=%s %ux%ux%u levels=%u layers=%u "
@@ -1132,6 +1150,7 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
 			// The render area follows the request, so a narrower image would be drawn past its edge.
 			recreate |= DepthGrowRecreate() && cached.info.extent.width < requested.extent.width;
+			recreate |= DepthHeightTooShort(cached.info, requested);
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
@@ -1523,6 +1542,7 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	const Common::HitchWhy::Span span(Common::HitchWhy::Cause::Image);
 	BufferCache::PerfCount(BufferCache::PerfEvent::ImageUpload);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
@@ -2729,6 +2749,10 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
+void BufferCache::ClearFillMeta(uint64_t vaddr, uint64_t size) {
+	(void)m_texture_cache.ClearMetaCovered(vaddr, size);
+}
+
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId selected) {
 	buffer.last_write_tick = m_scheduler.CurrentTick();
 
@@ -2966,6 +2990,48 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask.set();
 	return true;
+}
+
+bool TextureCache::GetMetaInfo(uint64_t address, uint64_t* size, uint32_t* layers, bool* owner_alive) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	*owner_alive      = owner != nullptr && owner->registered;
+	*size             = owner != nullptr ? owner->info.metadata.range.size : 0;
+	*layers           = owner != nullptr ? owner->info.resources.layers : 0;
+	return true;
+}
+
+static bool MetaCoverRule() {
+	static const bool cover = [] {
+		const char* strict = std::getenv("KYTY_META_CLEAR_STRICT");
+		const char* value  = std::getenv("KYTY_META_CLEAR_COVER");
+		return (strict == nullptr || strict[0] != '0') && (value == nullptr || value[0] != '0');
+	}();
+	return cover;
+}
+
+bool TextureCache::MetaCovered(uint64_t address, uint64_t bytes) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	if (owner == nullptr || !owner->registered) {
+		return false;
+	}
+	return bytes >= owner->info.metadata.range.size / std::max<uint64_t>(owner->info.resources.layers, 1);
+}
+
+bool TextureCache::ClearMetaCovered(uint64_t address, uint64_t bytes) {
+	if (MetaCoverRule() && !MetaCovered(address, bytes)) {
+		return false;
+	}
+	return ClearMeta(address);
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

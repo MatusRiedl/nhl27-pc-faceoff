@@ -167,7 +167,7 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
+project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.4.0)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -381,6 +381,15 @@ list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+endif()
+
+# Issue #1 diagnostic: KYTY_FORCE_SSE4A_TRAP=1 routes the guest's SSE4a through the trap emulator on AMD
+# hosts, as on Intel. Off in shipping builds: its hook costs PatchGuestInstructions its PGO profile.
+option(KYTY_SSE4A_TRAP_DIAG "Diagnostic build: honour KYTY_FORCE_SSE4A_TRAP (costs the guest patcher's PGO profile)" OFF)
+if (KYTY_SSE4A_TRAP_DIAG)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	                    "${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
+	             APPEND PROPERTY COMPILE_DEFINITIONS KYTY_SSE4A_TRAP_DIAG=1)
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
@@ -672,6 +681,11 @@ add_executable(frame_gen_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(frame_gen_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(dlss5_math_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Dlss5MathTests.cpp"
+)
+target_include_directories(dlss5_math_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
@@ -813,6 +827,20 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
 
+add_executable(event_flag_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EventFlagTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/eventFlagCore.cpp"
+)
+target_link_libraries(event_flag_tests common)
+target_include_directories(event_flag_tests PRIVATE ${inc_headers})
+target_compile_definitions(event_flag_tests PRIVATE KYTY_EVENT_FLAG_TESTS=1)
+
+add_executable(hitch_cpu_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/HitchCpuTests.cpp"
+)
+target_link_libraries(hitch_cpu_tests common)
+target_include_directories(hitch_cpu_tests PRIVATE ${inc_headers})
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -889,6 +917,7 @@ if(BUILD_TESTING)
 	add_test(NAME experiments COMMAND $<TARGET_FILE:experiments_tests>)
 	add_test(NAME compile_queue COMMAND $<TARGET_FILE:compile_queue_tests>)
 	add_test(NAME frame_gen COMMAND $<TARGET_FILE:frame_gen_tests>)
+	add_test(NAME dlss5_math COMMAND $<TARGET_FILE:dlss5_math_tests>)
 	add_test(NAME compute_resolve_ahead
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-resolve-ahead-only)
 	# The perf branch initializes diagnostic gates before main(), so the counter-based
@@ -917,6 +946,8 @@ if(BUILD_TESTING)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
+	add_test(NAME event_flag COMMAND $<TARGET_FILE:event_flag_tests>)
+	add_test(NAME hitch_cpu COMMAND $<TARGET_FILE:hitch_cpu_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
@@ -1001,6 +1032,7 @@ if(BUILD_TESTING)
 		experiments_tests
 		compile_queue_tests
 		frame_gen_tests
+		dlss5_math_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -1019,6 +1051,8 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		event_flag_tests
+		hitch_cpu_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
@@ -1241,6 +1275,17 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+
+# DLSS 5 (KYTY_DLSS5, src/graphics/presentation/fsr/dlss5Pass.h): the player's own nvngx_dlssnr.dll
+# only takes calls from a module whose path contains "nvngx.dll", so they go through this forwarder,
+# installed next to the exe. Our own code; the model itself is never built, installed or shipped.
+# Not in the KYTY_PGO targets (kyty_emulator, common).
+if(KYTY_ENABLE_DLSS AND WIN32)
+	add_library(dlss5_forwarder SHARED "${KYTY_SOURCE_DIR}/dlss5Forwarder/dlss5Forwarder.cpp")
+	set_target_properties(dlss5_forwarder PROPERTIES OUTPUT_NAME "nvngx.dll_dlssnr" PREFIX "")
+	add_dependencies(kyty_emulator dlss5_forwarder)
+	install(TARGETS dlss5_forwarder RUNTIME DESTINATION . LIBRARY DESTINATION . ARCHIVE EXCLUDE_FROM_ALL)
+endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 

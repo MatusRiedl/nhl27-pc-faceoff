@@ -2,6 +2,52 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
+## v0.40.0
+
+- 🛠️ **The full-match GPU hang is fixed.** The emulator dropped some GPU work as a "depth metadata clear" when the
+  game reused that memory for other data, for example the light data. That gave the dark "lights off" picture and,
+  later, the GPU hang. Now it drops only a proven clear. On the test PC, 9 of 9 full matches played to the end
+  (before the fix, 6 of 9 stopped).
+- ✨ **DLSS 5 (experimental, off by default).** Graphics tab → **DLSS 5** → On: NVIDIA's neural rendering on the
+  finished picture, with a strength slider. It runs on any NVIDIA GeForce RTX card. Faceoff downloads NVIDIA's
+  DLSS 5 file (276 MB) the first time you turn it on; it is not in the zip. On an RTX 5080 at 1440p it costs about
+  3 ms a frame and about 1.3 GB more RAM.
+- 🎞️ **Frame generation 2x, 3x or 4x.** A new **Generated frames** row under Frame generation: 2x adds one
+  generated frame per game frame, 4x adds three. 3x and 4x need an RTX 50 series card; RTX 40 cards get 2x. More
+  generated frames add a little input lag. DLSS 5 and frame generation can now be on together.
+- ⚡ **Fewer long stalls.** The emulator stops waiting for a GPU read that does not come back, a guard catches bad
+  GPU work counts, and the game no longer resets your resolution scale at scene cuts, so DLSS does not rebuild
+  there.
+- 🧠 **Less memory.** About 5 GB less committed memory in a match. Graphics memory can now go to system RAM when
+  the card is full, so a card with less video memory runs slower instead of failing (not tested on a real 6 or
+  8 GB card).
+- 🧊 **Freeze reports.** If the game freezes, the emulator writes a small report (`freeze_*.dmp`, a few MB) next
+  to the play log. Leave a frozen game for about a minute before you close it, then send both files on Discord.
+  The log also says when Windows ran out of memory.
+- **Other fixes:** minimizing the game window no longer risks a crash (the picture pauses until you restore it)
+  and a depth-image fix (both from upstream KytyPS5); Windows does not power-throttle the emulator; Intel CPUs: an
+  AMD-only instruction (INSERTQ) the game uses is now emulated (tested on an AMD PC with the Intel path forced
+  on); a new speed profile (PGO).
+- **Faceoff 0.40.0:** a memory check (a **This PC** card, and a note on Play when Windows has too little memory
+  room for a match; it does not block Play); the **Last run** line says what really ran, for example "frame
+  generation on (4x)"; updater fixes.
+- **What you need:** 16 GB of RAM is the minimum (tight, not tested here); 32 GB is recommended. About 8-9 GB of
+  video memory at 1440p. Keep the paging file "System managed": a match needs about 28 GB of commit room (RAM
+  plus paging file).
+- **First start:** the new build compiles its shaders again once, so the first arena load stutters for 30 s or
+  longer. Saves and the shader cache stay.
+- **Known:**
+  - Short heavy moments at a few fixed points of a match: 1-3 s of slower frames (about 20 fps).
+  - A short hitch every 5 minutes when the emulator saves the GPU driver cache (as in v0.30.0; the fix comes in
+    v0.41).
+  - 3x and 4x frame generation, and DLSS 5 together with frame generation, are new and had little testing. If one
+    misbehaves, turn it off and send the play log.
+  - Now and then a broken intro picture (old).
+  - Faceoff can open to a blank dark window while RivaTuner Statistics Server runs (old). Close it and start it
+    again.
+- **Updating:** Faceoff 0.30.0 and 0.20.2 update themselves to 0.40.0 and select v0.40.0. On v0.20.1 or older,
+  click **Update** once.
+
 ## v0.30.0
 
 - 🎞️ **DLSS frame generation (experimental).** On an NVIDIA GeForce RTX 40 or 50 series card, pick DLSS on the

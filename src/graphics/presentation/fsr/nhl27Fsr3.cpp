@@ -96,6 +96,9 @@ struct Nhl27Fsr3::Impl {
 	bool have_last = false, missed = true;
 	uint64_t resets = 0, present_skips = 0, dirty_reads = 0, clean_mismatches = 0, replaced = 0;
 	uint64_t dumps = 0;
+	// KYTY_UPSCALER_SIZE_HOLD (Nhl27SizeHold): frames left to the game at an odd size instead of a rebuild.
+	Nhl27SizeHold size_hold {SizeHoldLimit()};
+	uint64_t held_frames = 0, hold_events = 0;
 	// KYTY_FSR3_CLEAN_COLOR=1: broken and lone over-bright colour pixels are repaired before FSR
 	// (gpu_tiler_fsr_color_clean.comp). `clean` receives the repaired copy of `transfer`.
 	vk::Buffer clean = nullptr;
@@ -159,6 +162,47 @@ struct Nhl27Fsr3::Impl {
 		if (clean_layout) graphics.device.destroyPipelineLayout(clean_layout, nullptr);
 		if (guard_pipeline) graphics.device.destroyPipeline(guard_pipeline, nullptr);
 		if (guard_layout) graphics.device.destroyPipelineLayout(guard_layout, nullptr);
+	}
+	static uint32_t SizeHoldLimit() {
+		static const uint32_t limit = [] {
+			const char* value = std::getenv("KYTY_UPSCALER_SIZE_HOLD");
+			const long parsed = value != nullptr && value[0] != '\0' ? std::strtol(value, nullptr, 10) : 8;
+			const uint32_t frames = static_cast<uint32_t>(std::clamp(parsed, 0L, 600L));
+			std::printf("NHL27UPSCALE: size_hold=%u\n", frames);
+			std::fflush(stdout);
+			return frames;
+		}();
+		return limit;
+	}
+	// True = this frame stays with the game's own pass (no snapshot, no upscaler, no rebuild). Called first in
+	// EnsureImages, so the prepare pass is rejected before `captured` is set: the stale `captured` makes
+	// ReplacesDispatch fail its SameFrame check, so the game's accumulation pass runs and fills the frame, as after
+	// any rejected prepare pass.
+	[[gnu::noinline]] bool HoldForSize(const Nhl27Fsr3Constants& c) {
+		using Action = Nhl27SizeHold::Action;
+		const Nhl27SizeHold::Size size {c.Width(), c.Height(), c.OutputWidth(), c.OutputHeight()};
+		const auto& in = images[0].resource.extent;
+		const auto& out = images[3].resource.extent;
+		const Nhl27SizeHold::Size live {in.width, in.height, out.width, out.height};
+		const Action action = size_hold.Decide(size, images[0].resource.image ? &live : nullptr);
+		if (size_hold.ended != 0 && (hold_events <= 16 || hold_events % 100 == 0)) {
+			std::printf("NHL27UPSCALE size-hold end n=%llu held=%u result=%s guest_frame=%u total_held=%llu\n",
+						static_cast<unsigned long long>(hold_events), size_hold.ended,
+						action == Action::Rebuild ? "rebuild" : "returned", c.Frame(),
+						static_cast<unsigned long long>(held_frames));
+			std::fflush(stdout);
+		}
+		if (action != Action::Hold) return false;
+		++held_frames;
+		if (size_hold.held == 1 && (++hold_events <= 16 || hold_events % 100 == 0)) {
+			std::printf("NHL27UPSCALE size-hold start n=%llu size=%ux%u->%ux%u live=%ux%u->%ux%u guest_frame=%u\n",
+						static_cast<unsigned long long>(hold_events), size[0], size[1], size[2], size[3], live[0],
+						live[1], live[2], live[3], c.Frame());
+			std::fflush(stdout);
+		}
+		stage = 0;
+		missed = true; // the next frame the upscaler takes starts a fresh history
+		return true;
 	}
 	void Reject(const char* why) {
 		stage = 0;
@@ -1037,6 +1081,9 @@ struct Nhl27Fsr3::Impl {
 			target.layout != vk::ImageLayout::eUndefined;
 	}
 	bool EnsureImages(RenderContext& context, const Nhl27Fsr3Constants& c) {
+		// A held frame returns false: OnDispatch rejects the prepare pass ("prepare-layout-or-allocation"). The check
+		// sits here and not in OnDispatch, which runs for every guest dispatch and keeps its PGO profile this way.
+		if (HoldForSize(c)) return false;
 		const vk::Extent2D input {c.Width(), c.Height()}, output {c.OutputWidth(), c.OutputHeight()};
 		if (images[0].resource.image && images[0].resource.extent == input &&
 			images[3].resource.extent == output) return true;

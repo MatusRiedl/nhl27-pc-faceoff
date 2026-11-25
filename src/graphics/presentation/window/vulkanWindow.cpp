@@ -14,9 +14,11 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vramPolicy.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/dlss5Pass.h"
 #include "graphics/presentation/fsr/dlssBridge.h"
 #include "graphics/presentation/fsr/frameGen.h"
 #include "graphics/presentation/fsr/nhl27Fsr3.h"
@@ -938,6 +940,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
 	}
+	// KYTY_VRAM_PAGEABLE (vramPolicy.h): AppendVramExtensions lists these only when their features are supported.
+	vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_memory {};
+	if (HasExtension(device_extensions, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME)) {
+		pageable_memory.pNext                     = const_cast<void*>(create_info.pNext);
+		pageable_memory.pageableDeviceLocalMemory = VK_TRUE;
+		create_info.pNext                         = &pageable_memory;
+	}
+	vk::PhysicalDeviceMemoryPriorityFeaturesEXT memory_priority {};
+	if (HasExtension(device_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+		memory_priority.pNext          = const_cast<void*>(create_info.pNext);
+		memory_priority.memoryPriority = VK_TRUE;
+		create_info.pNext              = &memory_priority;
+	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = static_cast<uint32_t>(queue_create_infos.size());
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1003,6 +1018,39 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 
 	return device;
+}
+
+// KYTY_VRAM_PAGEABLE (default 1, vramPolicy.h): with pageable device-local memory the driver moves idle video memory
+// to system memory when VRAM is full instead of refusing allocations (a 6 GB card runs out in a match). The extension
+// requires VK_EXT_memory_priority. Both are listed only when their features are supported, so VulkanCreateDevice
+// can enable the features whenever the names are in the list.
+[[gnu::noinline]] static void AppendVramExtensions(GraphicContext&                             graphics,
+                                                   const std::vector<vk::ExtensionProperties>& available,
+                                                   std::vector<const char*>&                   device_extensions) {
+	const auto heap0_mb =
+	    static_cast<unsigned long long>(graphics.physical_device_memory_properties.memoryHeaps[0].size >> 20u);
+	const char* state = "unsupported";
+	if (HasExtension(available, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) &&
+	    HasExtension(available, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceMemoryPriorityFeaturesEXT            priority {};
+		vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable {};
+		pageable.pNext = &priority;
+		vk::PhysicalDeviceFeatures2 features {};
+		features.pNext = &pageable;
+		graphics.physical_device.getFeatures2(&features);
+		if (pageable.pageableDeviceLocalMemory == VK_TRUE && priority.memoryPriority == VK_TRUE) {
+			if (Vram::PageableWanted()) {
+				device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+				device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+				Vram::SetPriorityEnabled(true);
+				state = "on";
+			} else {
+				state = "off";
+			}
+		}
+	}
+	std::printf("NHL27VRAM pageable=%s heap0=%lluMB\n", state, heap0_mb);
+	std::fflush(stdout);
 }
 
 static void VulkanGetExtensions(VulkanExtensions& r) {
@@ -1307,6 +1355,9 @@ void NvxSelfTest(const char* where) {
 // then owns less address space (about 66 GiB on an RTX 5080), so this runs only with KYTY_DLSS=1 in a DLSS build;
 // KYTY_DLSS_WARMUP=0 skips it.
 void DlssWarmUp() {
+	// DLSS 5 (KYTY_DLSS5=1, dlss5Pass.h): the forwarder and the 276 MB model map before the guest
+	// reservation too.
+	Dlss5::LoadEarly();
 	if (!DlssEarlyWarmUpWanted()) {
 		return;
 	}
@@ -1526,6 +1577,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		AppendVramExtensions(graphic_ctx, available_extensions, device_extensions);
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

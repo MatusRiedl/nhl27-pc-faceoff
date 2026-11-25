@@ -6,7 +6,9 @@
 // driver resets the device.
 layout(local_size_x=1) in;
 layout(buffer_reference, std430, buffer_reference_align=4) buffer Words { uint words[]; };
-layout(buffer_reference, std430, buffer_reference_align=8) buffer Trips { uint count; uint pad; uint64_t addresses[16]; };
+// Read by the CPU for the NHL27GUARD lines (nativeIndirect.cpp): addresses at byte 8, values at byte 144
+// (the raw x, y, z the guard read, so a garbage pattern can be told from a count that grows).
+layout(buffer_reference, std430, buffer_reference_align=8) buffer Trips { uint count; uint pad; uint64_t addresses[16]; uvec4 values[16]; };
 layout(push_constant, std430) uniform Params {
  uint64_t source;
  uint64_t destination;
@@ -29,6 +31,7 @@ void main() {
   Trips trips = Trips(p.trips);
   uint index = atomicAdd(trips.count, 1u);
   trips.addresses[index % 16u] = p.guest_address;
+  trips.values[index % 16u] = uvec4(x, y, z, 0u);
  }
  dst.words[0] = bad ? 0u : x;
  dst.words[1] = bad ? 0u : y;

@@ -172,4 +172,61 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Refresh();
 }
 
+// Wait with a timeout (duy64 e5afd69c): the same fast path and accounting as Wait, but the
+// semaphore wait ends after timeout_ns and the caller learns whether the tick completed. A
+// timeout is not an error; any other failure keeps Wait's diagnostics and abort. Wait itself is
+// left as it is (a separate function keeps its PGO profile). WaitFor does not call NoteLongWait:
+// a second caller would stop that static function from being inlined into Wait and change Wait's
+// CFG, and with it Wait's PGO profile. NHL27RDWAIT times these waits instead; an escape's long
+// wait still goes through Wait.
+bool MasterSemaphore::WaitFor(uint64_t tick, uint64_t timeout_ns) {
+	if (IsFree(tick)) {
+		return true;
+	}
+	Refresh();
+	if (IsFree(tick)) {
+		return true;
+	}
+
+	const bool on_gpu_thread = GuestGpu::IsGpuThread();
+	FrameBreakdown::Timer wait_timer(FrameBreakdown::g_counters.gpu_wait_ns, on_gpu_thread);
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_WAIT);
+	if (on_gpu_thread) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.gpu_wait_count);
+	}
+
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_semaphore;
+	wait_info.pValues        = &tick;
+
+	const bool timed = BufferCache::PerfTimersEnabled() && on_gpu_thread;
+	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	Common::Timeline::Mark("host-wait", tick);
+	Common::Timeline::MarkStack();
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, timeout_ns);
+	Common::Timeline::Mark("host-done", tick);
+	if (result != vk::Result::eSuccess && result != vk::Result::eTimeout) {
+		std::printf("NHL27SEMAWAIT: waitSemaphores failed result=%d tick=%llu gpu_thread=%d (timed wait)\n",
+		            static_cast<int>(result), static_cast<unsigned long long>(tick), on_gpu_thread ? 1 : 0);
+		std::fflush(stdout);
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceLost(m_graphics);
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess && result != vk::Result::eTimeout);
+	Refresh();
+	if (result != vk::Result::eSuccess) {
+		return false;
+	}
+	if (timed) {
+		BufferCache::PerfAddTime(BufferCache::PerfTimer::GpuWait,
+		                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                             std::chrono::steady_clock::now() - start).count()));
+	}
+	return true;
+}
+
 } // namespace Libs::Graphics

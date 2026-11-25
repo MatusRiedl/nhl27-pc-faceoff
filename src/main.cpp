@@ -3,6 +3,8 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/freezeDump.h"
+#include "common/hostStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -559,6 +561,10 @@ void NvxSelfTest(const char* where);
 } // namespace Libs::Graphics
 
 static int Main(int argc, char* argv[]) {
+	// NHL27FREEZE dump helper: started by the watchdog of a running emulator; no start-up here.
+	if (argc >= 2 && std::string_view(argv[1]) == Common::FreezeDump::kHelperArg) {
+		return Common::FreezeDump::HelperMain(argc, argv);
+	}
 	Libs::Graphics::NvxSelfTest("T0_main");
 	VirtualMemory::Init();
 	InitializeThreads();
@@ -584,6 +590,9 @@ static int Main(int argc, char* argv[]) {
 		PrintUsage();
 		return 0;
 	}
+
+	Common::OptOutOfPowerThrottling();
+	Common::FreezeDump::Start();
 
 	Run(options);
 

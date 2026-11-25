@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/freezeDump.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -49,6 +50,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// After windows.h.
+#include <tlhelp32.h>
 #else
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -89,6 +92,286 @@ bool NhlWriteGuest(uint64_t address, const void* data, uint64_t size) {
 	return true;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// KYTY_NHL_RES_WATCH=1 (diagnostic, logging only): hardware data watchpoints (DR0/DR1: write, 4 bytes) on
+// ResolutionScale (+0x170) and ResolutionScaleMin (+0xc0) in every thread of the process. A hit logs the
+// storing instruction (eboot+offset), the code bytes around it, the registers, both field values and
+// eboot return addresses found on the stack. The hit does not change the values.
+struct NhlWatchHit {
+	std::atomic<uint64_t> seq {0};
+	uint32_t              tid   = 0;
+	uint32_t              which = 0;
+	uint64_t              ns    = 0;
+	uint64_t              rip   = 0;
+	uint64_t              regs[16] {};
+	float                 scale = 0.0f;
+	float                 min   = 0.0f;
+	uint8_t               code[64] {};
+	uint64_t              ret[4] {};
+};
+constexpr uint32_t    NhlWatchRing      = 512;
+constexpr uint64_t    NhlWatchImageSize = 0x11000000;
+NhlWatchHit           g_nhl_watch_hits[NhlWatchRing];
+std::atomic<uint64_t> g_nhl_watch_next {0};
+uint64_t              g_nhl_watch_addr[2] {};
+uint64_t              g_nhl_watch_base = 0;
+std::atomic<uint32_t> g_nhl_poller_tid {0};
+
+uint64_t NhlWatchNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+LONG WINAPI NhlWatchFilter(PEXCEPTION_POINTERS info) {
+	if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	CONTEXT*       c     = info->ContextRecord;
+	const uint32_t which = static_cast<uint32_t>(c->Dr6 & 0x3u);
+	if (which == 0) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const uint64_t n = g_nhl_watch_next.fetch_add(1, std::memory_order_relaxed);
+	NhlWatchHit&   h = g_nhl_watch_hits[n % NhlWatchRing];
+	h.seq.store(0, std::memory_order_relaxed);
+	h.tid   = GetCurrentThreadId();
+	h.which = which;
+	h.ns    = NhlWatchNowNs();
+	h.rip   = c->Rip;
+	const uint64_t regs[16] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp,
+	                           c->R8,  c->R9,  c->R10, c->R11, c->R12, c->R13, c->R14, c->R15};
+	std::memcpy(h.regs, regs, sizeof(regs));
+	std::memcpy(&h.scale, reinterpret_cast<const void*>(g_nhl_watch_addr[0]), sizeof(float));
+	std::memcpy(&h.min, reinterpret_cast<const void*>(g_nhl_watch_addr[1]), sizeof(float));
+	std::memset(h.code, 0, sizeof(h.code));
+	if (c->Rip >= 48 && Common::VirtualMemory::IsReadable(c->Rip - 48, sizeof(h.code))) {
+		std::memcpy(h.code, reinterpret_cast<const void*>(c->Rip - 48), sizeof(h.code));
+	}
+	std::memset(h.ret, 0, sizeof(h.ret));
+	if (Common::VirtualMemory::IsReadable(c->Rsp, 0x800)) {
+		uint32_t found = 0;
+		for (uint64_t k = 0; k < 0x800 / 8 && found < 4; k++) {
+			uint64_t q = 0;
+			std::memcpy(&q, reinterpret_cast<const void*>(c->Rsp + k * 8), sizeof(q));
+			if (q > g_nhl_watch_base && q < g_nhl_watch_base + NhlWatchImageSize) {
+				h.ret[found++] = q;
+			}
+		}
+	}
+	h.seq.store(n + 1, std::memory_order_release);
+	c->Dr6 = 0;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Arms one thread: 1 = newly armed, 2 = was already armed, 0 = failed. Nothing between SuspendThread and
+// ResumeThread may allocate or print (the suspended thread can hold the heap or CRT lock).
+int NhlWatchArm(DWORD tid) {
+	HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, tid);
+	if (h == nullptr) {
+		return 0;
+	}
+	int result = 0;
+	if (SuspendThread(h) != static_cast<DWORD>(-1)) {
+		CONTEXT ctx {};
+		ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+		if (GetThreadContext(h, &ctx) != 0) {
+			if (ctx.Dr0 == g_nhl_watch_addr[0] && ctx.Dr1 == g_nhl_watch_addr[1] && (ctx.Dr7 & 0x5u) == 0x5u) {
+				result = 2;
+			} else {
+				ctx.Dr0 = g_nhl_watch_addr[0];
+				ctx.Dr1 = g_nhl_watch_addr[1];
+				// L0 and L1 on; RW=01 (write), LEN=11 (4 bytes) for both slots.
+				ctx.Dr7 = (ctx.Dr7 & ~((0xffull << 16u) | 0xfull)) | 0x5u | (0xdull << 16u) | (0xdull << 20u);
+				ctx.Dr6 = 0;
+				result  = SetThreadContext(h, &ctx) != 0 ? 1 : 0;
+			}
+		}
+		ResumeThread(h);
+	}
+	CloseHandle(h);
+	return result;
+}
+
+void NhlWatchPrintHit(const NhlWatchHit& h, uint64_t n, uint64_t start_ns) {
+	const auto rel = [](uint64_t a) -> unsigned long long {
+		return static_cast<unsigned long long>(
+		    a >= g_nhl_watch_base && a < g_nhl_watch_base + NhlWatchImageSize ? a - g_nhl_watch_base : a);
+	};
+	const bool poller = h.tid == g_nhl_poller_tid.load(std::memory_order_relaxed);
+	::printf("NHL27RESWATCH: hit #%llu t=%.3f tid=%u%s field=%s%s rip=eboot+0x%llx scale=%g min=%g "
+	         "ret=0x%llx,0x%llx,0x%llx,0x%llx\n",
+	         static_cast<unsigned long long>(n), static_cast<double>(h.ns - start_ns) / 1e9, h.tid,
+	         poller ? "(poller)" : "", (h.which & 1u) != 0 ? "scale" : "", (h.which & 2u) != 0 ? "min" : "",
+	         rel(h.rip), h.scale, h.min, rel(h.ret[0]), rel(h.ret[1]), rel(h.ret[2]), rel(h.ret[3]));
+	::printf("NHL27RESWATCH:   regs rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx rsp=%llx "
+	         "r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+	         static_cast<unsigned long long>(h.regs[0]), static_cast<unsigned long long>(h.regs[1]),
+	         static_cast<unsigned long long>(h.regs[2]), static_cast<unsigned long long>(h.regs[3]),
+	         static_cast<unsigned long long>(h.regs[4]), static_cast<unsigned long long>(h.regs[5]),
+	         static_cast<unsigned long long>(h.regs[6]), static_cast<unsigned long long>(h.regs[7]),
+	         static_cast<unsigned long long>(h.regs[8]), static_cast<unsigned long long>(h.regs[9]),
+	         static_cast<unsigned long long>(h.regs[10]), static_cast<unsigned long long>(h.regs[11]),
+	         static_cast<unsigned long long>(h.regs[12]), static_cast<unsigned long long>(h.regs[13]),
+	         static_cast<unsigned long long>(h.regs[14]), static_cast<unsigned long long>(h.regs[15]));
+	char hex[sizeof(h.code) * 2 + 1] {};
+	for (size_t i = 0; i < sizeof(h.code); i++) {
+		std::snprintf(hex + i * 2, 3, "%02x", h.code[i]);
+	}
+	::printf("NHL27RESWATCH:   code rip-48..rip+16 %s\n", hex);
+}
+
+// Started once by the resolution poller when it has found the settings object.
+void StartNhlResolutionWatch(uint64_t settings, uint64_t eboot_base) {
+	g_nhl_watch_addr[0] = settings + 0x170;
+	g_nhl_watch_addr[1] = settings + 0xc0;
+	g_nhl_watch_base    = eboot_base;
+	if (AddVectoredExceptionHandler(0, NhlWatchFilter) == nullptr) {
+		::printf("NHL27RESWATCH: AddVectoredExceptionHandler failed\n");
+		return;
+	}
+	std::thread([] {
+		const DWORD    self     = GetCurrentThreadId();
+		const DWORD    pid      = GetCurrentProcessId();
+		const uint64_t start_ns = NhlWatchNowNs();
+		std::map<DWORD, bool> armed;
+		std::vector<DWORD>    tids;
+		uint64_t              printed      = 0;
+		uint64_t              full_printed = 0;
+		uint64_t              last_status  = 0;
+		uint64_t              hits_at_last = 0;
+		uint32_t              lost_total   = 0;
+		float                 last_value[2] = {-100.0f, -100.0f};
+		::printf("NHL27RESWATCH: on, scale at 0x%016llx, min at 0x%016llx, eboot 0x%016llx\n",
+		         static_cast<unsigned long long>(g_nhl_watch_addr[0]),
+		         static_cast<unsigned long long>(g_nhl_watch_addr[1]), static_cast<unsigned long long>(g_nhl_watch_base));
+		for (uint32_t pass = 0;; pass++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			const bool recheck = pass % 10 == 0;
+			tids.clear();
+			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snap != INVALID_HANDLE_VALUE) {
+				THREADENTRY32 te {};
+				te.dwSize = sizeof(te);
+				if (Thread32First(snap, &te) != 0) {
+					do {
+						if (te.th32OwnerProcessID == pid && te.th32ThreadID != self) {
+							tids.push_back(te.th32ThreadID);
+						}
+						te.dwSize = sizeof(te);
+					} while (Thread32Next(snap, &te) != 0);
+				}
+				CloseHandle(snap);
+			}
+			uint32_t fresh = 0;
+			uint32_t lost  = 0;
+			uint32_t failed = 0;
+			for (DWORD tid: tids) {
+				const auto it  = armed.find(tid);
+				const bool had = it != armed.end();
+				if (had && !recheck) {
+					continue;
+				}
+				const int r = NhlWatchArm(tid);
+				if (r == 0) {
+					failed++;
+					continue;
+				}
+				if (r == 1) {
+					if (had) {
+						lost++;
+					} else {
+						fresh++;
+					}
+				}
+				armed[tid] = true;
+			}
+			lost_total += lost;
+			const uint64_t next = g_nhl_watch_next.load(std::memory_order_acquire);
+			if (next > printed + NhlWatchRing) {
+				printed = next - NhlWatchRing;
+			}
+			for (; printed < next; printed++) {
+				const NhlWatchHit& h = g_nhl_watch_hits[printed % NhlWatchRing];
+				if (h.seq.load(std::memory_order_acquire) != printed + 1) {
+					break;
+				}
+				const int  field   = (h.which & 1u) != 0 ? 0 : 1;
+				const float value  = field == 0 ? h.scale : h.min;
+				if (full_printed < 24 || value != last_value[field]) {
+					if (full_printed < 400) {
+						NhlWatchPrintHit(h, printed, start_ns);
+						full_printed++;
+					}
+				}
+				last_value[field] = value;
+			}
+			{
+				const uint64_t now = NhlWatchNowNs();
+				if (pass == 0 || now - last_status >= 2000000000ull) {
+					::printf("NHL27RESWATCH: t=%.3f threads=%zu armed=%zu new=%u lost=%u (total %u) failed=%u "
+					         "hits=%llu (+%llu)\n",
+					         static_cast<double>(now - start_ns) / 1e9, tids.size(), armed.size(), fresh, lost,
+					         lost_total, failed, static_cast<unsigned long long>(next),
+					         static_cast<unsigned long long>(next - hits_at_last));
+					last_status  = now;
+					hits_at_last = next;
+				}
+			}
+		}
+	}).detach();
+}
+#endif
+
+// At every scene change the game copies a per-scene preset into the settings (function eboot+0x7919500,
+// found with KYTY_NHL_RES_WATCH=1 on 2026-11-22). The copy puts the preset scale (0.91666) and minimum (1)
+// back; the poller then writes the chosen scale again, so the frame size changes twice at each cut and the
+// upscaler re-creates itself twice. This replaces the two stores (scale +0x170, minimum +0xc0) with NOPs,
+// so the chosen scale stays across cuts. The other copies in that function (+0x211, +0x18c) and its calls
+// stay. The bytes are checked first; on a mismatch nothing changes and the poller works as before. It runs
+// before any game code, so no thread can run these bytes while they change.
+void NhlPatchCutStores(uint64_t eboot_base) {
+	constexpr uint64_t Offset = 0x7919614;
+	static constexpr uint8_t Expected[18] = {0xc4, 0xc1, 0x7a, 0x11, 0x85, 0x70, 0x01, 0x00, 0x00,
+	                                         0xc4, 0xc1, 0x7a, 0x11, 0x95, 0xc0, 0x00, 0x00, 0x00};
+	static constexpr uint8_t Nops[18]     = {0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+	                                         0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+	const uint64_t           address      = eboot_base + Offset;
+	const auto               offset_print = static_cast<unsigned long long>(Offset);
+	if (!Common::VirtualMemory::IsReadable(address, sizeof(Expected))) {
+		::printf("NHL27RES: cut stores not patched: eboot+0x%llx is not readable\n", offset_print);
+		return;
+	}
+	uint8_t current[sizeof(Expected)] = {};
+	std::memcpy(current, reinterpret_cast<const void*>(address), sizeof(current));
+	if (std::memcmp(current, Nops, sizeof(Nops)) == 0) {
+		::printf("NHL27RES: cut stores already patched at eboot+0x%llx\n", offset_print);
+		return;
+	}
+	if (std::memcmp(current, Expected, sizeof(Expected)) != 0) {
+		::printf("NHL27RES: cut stores not patched: the bytes at eboot+0x%llx differ (other game version?)\n",
+		         offset_print);
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void* ptr         = reinterpret_cast<void*>(static_cast<uintptr_t>(address));
+	DWORD old_protect = 0;
+	if (VirtualProtect(ptr, sizeof(Nops), PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
+		::printf("NHL27RES: cut stores not patched: VirtualProtect failed (0x%08lx)\n",
+		         static_cast<unsigned long>(GetLastError()));
+		return;
+	}
+	std::memcpy(ptr, Nops, sizeof(Nops));
+	DWORD      unused   = 0;
+	const bool restored = VirtualProtect(ptr, sizeof(Nops), old_protect, &unused) != 0;
+	Common::VirtualMemory::FlushInstructionCache(address, sizeof(Nops));
+	::printf("NHL27RES: cut stores patched at eboot+0x%llx (the scale stays at scene changes)%s\n", offset_print,
+	         restored ? "" : "; the old page protection was NOT restored");
+#else
+	::printf("NHL27RES: cut stores not patched: not supported on this platform\n");
+#endif
+}
+
 void StartNhlResolutionScale(uint64_t eboot_base) {
 	const char* env = std::getenv("KYTY_NHL_RES_SCALE");
 	if (env == nullptr || eboot_base == 0) {
@@ -99,14 +382,48 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 		::printf("NHL27RES: ignoring KYTY_NHL_RES_SCALE=%s (expected 0.25..1.0)\n", env);
 		return;
 	}
-	std::thread([eboot_base, scale] {
+	// KYTY_NHL_RES_CUT_PATCH (default 1; 0 = as before 2026-11-22, the game puts its scale back at every
+	// scene change): see NhlPatchCutStores.
+	if (const char* cut = std::getenv("KYTY_NHL_RES_CUT_PATCH"); cut == nullptr || std::atoi(cut) != 0) {
+		NhlPatchCutStores(eboot_base);
+	} else {
+		::printf("NHL27RES: cut stores not patched (KYTY_NHL_RES_CUT_PATCH=0)\n");
+	}
+	// KYTY_NHL_RES_POLL_MS (default 1; 50 = v0.40.0 and older): how often the scale is checked. The game
+	// puts its own scale (0.91666) back at scene changes; a frame rendered at it makes the upscaler
+	// re-create itself twice (to 3520x1980 and back), a long frame each time.
+	int poll_ms = 1;
+	if (const char* value = std::getenv("KYTY_NHL_RES_POLL_MS"); value != nullptr) {
+		const int parsed = std::atoi(value);
+		if (parsed >= 1 && parsed <= 1000) poll_ms = parsed;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const char* watch_env = std::getenv("KYTY_NHL_RES_WATCH");
+	const bool  watch     = watch_env != nullptr && std::atoi(watch_env) == 1;
+#else
+	const bool watch = false;
+#endif
+	std::thread([eboot_base, scale, poll_ms, watch] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		g_nhl_poller_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+		bool watching = false;
+#else
+		(void)watch;
+#endif
 		constexpr uint64_t SlotOffset     = 0xf1ef808;
 		constexpr uint64_t ScaleOffset    = 0x170;
 		constexpr uint64_t ScaleMinOffset = 0xc0;
 		uint64_t           announced      = 0;
 		uint32_t           writes         = 0;
+		uint32_t           polls          = 0;
+		const auto         poll_start     = std::chrono::steady_clock::now();
 		for (;;) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+			if (++polls == 2000) {
+				const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+				                                                            poll_start).count();
+				::printf("NHL27RES: poll_ms=%d achieved=%.2f ms\n", poll_ms, ms / polls);
+			}
 			uint64_t settings = 0;
 			if (!NhlReadGuest(eboot_base + SlotOffset, &settings,
 			                                            sizeof(settings)) ||
@@ -140,6 +457,12 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 				::printf("NHL27RES: settings at 0x%016llx scale=%g min=%g drs=%u -> %g\n",
 				         static_cast<unsigned long long>(settings), current, current_min,
 				         static_cast<unsigned>(drs), scale);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				if (watch && !watching) {
+					watching = true;
+					StartNhlResolutionWatch(settings, eboot_base);
+				}
+#endif
 			}
 			if (current != scale || current_min != scale) {
 				const bool wrote = NhlWriteGuest(settings + ScaleOffset, &scale, sizeof(scale)) &&
@@ -318,6 +641,8 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 				}
 				printf("NHL27COREDUMP: thread=%s guest return addresses:%s\n", thread_name, frames.c_str());
 				std::fflush(stdout);
+				// NHL27FREEZE: the first call writes freeze_<time>.dmp (waits up to 10 s for it).
+				Common::FreezeDump::OnGameCoredump(thread_name);
 			}
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
@@ -2154,6 +2479,12 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	return base_size;
 }
 
+// The AMD CPU compatibility log line's label. Out of line so LoadProgramToMemory keeps its PGO profile.
+[[gnu::noinline]] static const char* AmdCompatibilityLabel() noexcept {
+	return X64InstructionEmulator::ForceSse4aTrap() ? "AMD CPU compatibility (KYTY_FORCE_SSE4A_TRAP)"
+	                                                : "AMD CPU compatibility";
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
@@ -2187,7 +2518,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	// Plain bools and `|`, not `||` around the call, so this function keeps its PGO profile.
+	const bool force_sse4a = X64InstructionEmulator::ForceSse4aTrap();
+	const bool amd_sites   = emulate_amd | force_sse4a;
+	const bool patch_guest_instructions = protect_memory_faults || amd_sites;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -2311,7 +2645,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			                                           protect_memory_faults, amd_sites);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -2330,7 +2664,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.unrelocatable_memory_instruction_count);
 			}
 		}
-		if (emulate_amd && have_function_starts) {
+		if (amd_sites && have_function_starts) {
 			InstructionPatchCounts combined {};
 			std::string            details;
 			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
@@ -2350,7 +2684,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
 			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+			    fmt::format("{}: {} {} ({})\n", AmdCompatibilityLabel(), module_name, status, details));
 		}
 	}
 

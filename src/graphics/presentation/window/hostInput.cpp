@@ -1,4 +1,5 @@
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/inputPipe.h"
 
 #include <SDL3/SDL.h>
 
@@ -833,6 +834,7 @@ void HostInputDisconnectGamepad(int id) {
 
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
+	InputPipeStart();
 	if (const auto* path = std::getenv("KYTY_INPUT_FILE"); path != nullptr) {
 		g_scripted_input.path = path;
 	}

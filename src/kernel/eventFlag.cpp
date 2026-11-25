@@ -2,53 +2,21 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/freezeDump.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
-#include "common/threads.h"
-#include "common/timer.h"
+#include "kernel/eventFlagCore.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::LibKernel::EventFlag {
 
 LIB_NAME("libkernel", "libkernel");
-
-class KernelEventFlagPrivate {
-public:
-	enum class Result { Ok, AlreadyWaiting, TimedOut, Canceled, Deleted };
-
-	enum class ClearMode { None, All, Bits };
-
-	enum class WaitMode { And, Or };
-
-	KernelEventFlagPrivate(const std::string& name, bool single, bool /*fifo*/, uint64_t bits)
-	    : m_name(name), m_single_thread(single), m_bits(bits) {}
-	virtual ~KernelEventFlagPrivate();
-
-	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
-
-	void   Set(uint64_t bits);
-	void   Clear(uint64_t bits);
-	void   Cancel(uint64_t bits, int* num_waiting_threads);
-	Result Wait(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result,
-	            uint32_t* ptr_micros);
-
-	Result Poll(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result) {
-		uint32_t micros = 0;
-		return Wait(bits, wait_mode, clear_mode, result, &micros);
-	}
-
-private:
-	enum class Status { Set, Canceled, Deleted };
-
-	Common::Mutex   m_mutex;
-	Common::CondVar m_cond_var;
-	Status          m_status          = Status::Set;
-	int             m_waiting_threads = 0;
-	std::string     m_name;
-	bool            m_single_thread = false;
-	uint64_t        m_bits          = 0;
-};
 
 namespace {
 
@@ -76,164 +44,58 @@ EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
 	return mode;
 }
 
+// NHL27EVMISS: the first 20 would-miss (KYTY_EVFLAG_RELEASE_AT_SET=0) or saved (=1) releases.
+std::atomic<int> g_miss_lines {0};
+constexpr int    kMissLines = 20;
+
+void PrintMiss(const MissEvent& e) {
+	if (g_miss_lines.fetch_add(1, std::memory_order_relaxed) >= kMissLines) {
+		return;
+	}
+	std::printf("NHL27EVMISS: %s flag=%s pattern=0x%llx mode=%s clear=%d bits_at_set=0x%llx bits_now=0x%llx "
+	            "waiters=%u\n",
+	            e.saved ? "saved" : "would_miss", e.name, static_cast<unsigned long long>(e.pattern),
+	            e.and_mode ? "and" : "or", static_cast<int>(e.clear), static_cast<unsigned long long>(e.bits_at_set),
+	            static_cast<unsigned long long>(e.bits_now), e.waiters);
+	std::fflush(stdout);
+}
+
+void WriteFreezeDetail(char* text, size_t size) {
+	DescribeWaitingFlags(text, size);
+}
+
+// KYTY_EVFLAG_RELEASE_AT_SET, read once at the first create ("1" = release at Set; anything else = today's
+// release at wake). Also installs the miss line and the freeze-report detail.
+KernelEventFlagPrivate::Release StartRelease() {
+	static const KernelEventFlagPrivate::Release release = [] {
+		const char* value  = std::getenv("KYTY_EVFLAG_RELEASE_AT_SET");
+		const bool  at_set = (value != nullptr && value[0] == '1');
+		SetMissHook(&PrintMiss);
+		Common::FreezeDump::SetDetailProvider(&WriteFreezeDetail);
+		std::printf("NHL27EVFLAG: release_at_set=%d\n", at_set ? 1 : 0);
+		std::fflush(stdout);
+		return at_set ? KernelEventFlagPrivate::Release::AtSet : KernelEventFlagPrivate::Release::AtWake;
+	}();
+	return release;
+}
+
 } // namespace
 
-KernelEventFlagPrivate::~KernelEventFlagPrivate() {
-	Common::LockGuard lock(m_mutex);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
+void PrintEventFlagStats() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(30)) {
+		return;
 	}
-
-	m_status = Status::Deleted;
-
-	m_cond_var.SignalAll();
-
-	while (m_waiting_threads > 0) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-}
-
-KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitMode wait_mode,
-                                                            ClearMode clear_mode, uint64_t* result,
-                                                            uint32_t* ptr_micros) {
-	Common::LockGuard lock(m_mutex);
-
-	uint32_t micros     = 0;
-	bool     infinitely = true;
-	if (ptr_micros != nullptr) {
-		micros     = *ptr_micros;
-		infinitely = false;
-	}
-
-	uint32_t      elapsed = 0;
-	Common::Timer t;
-	t.Start();
-
-	auto update_timeout = [&]() {
-		if (ptr_micros != nullptr) {
-			*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
-		}
+	last    = now;
+	auto& c = Counters();
+	auto  total = [](std::atomic<uint64_t>& slot) {
+		return static_cast<unsigned long long>(slot.load(std::memory_order_relaxed));
 	};
-
-	if (m_single_thread && m_waiting_threads > 0) {
-		return Result::AlreadyWaiting;
-	}
-
-	while (!((wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
-	         (wait_mode == WaitMode::Or && (m_bits & bits) != 0))) {
-		if ((elapsed >= micros && !infinitely)) {
-			if (result != nullptr) {
-				*result = m_bits;
-			}
-			update_timeout();
-			return Result::TimedOut;
-		}
-
-		m_waiting_threads++;
-
-		if (infinitely) {
-			m_cond_var.Wait(&m_mutex);
-		} else {
-			m_cond_var.WaitFor(&m_mutex, micros - elapsed);
-		}
-
-		m_waiting_threads--;
-
-		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
-
-		switch (m_status) {
-			case Status::Canceled:
-				if (result != nullptr) {
-					*result = m_bits;
-				}
-				update_timeout();
-				return Result::Canceled;
-			case Status::Deleted:
-				if (result != nullptr) {
-					*result = m_bits;
-				}
-				update_timeout();
-				return Result::Deleted;
-			case Status::Set: break;
-		}
-	}
-
-	if (result != nullptr) {
-		*result = m_bits;
-	}
-	update_timeout();
-
-	switch (clear_mode) {
-		case ClearMode::All: m_bits = 0; break;
-		case ClearMode::Bits: m_bits &= ~bits; break;
-		case ClearMode::None: break;
-	}
-
-	return Result::Ok;
-}
-
-void KernelEventFlagPrivate::Set(uint64_t bits) {
-	Common::LockGuard lock(m_mutex);
-
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_bits |= bits;
-
-	m_cond_var.SignalAll();
-}
-
-void KernelEventFlagPrivate::Clear(uint64_t bits) {
-	Common::LockGuard lock(m_mutex);
-
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_bits &= bits;
-}
-
-void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
-	Common::LockGuard lock(m_mutex);
-
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	if (num_waiting_threads != nullptr) {
-		*num_waiting_threads = m_waiting_threads;
-	}
-
-	m_status = Status::Canceled;
-	m_bits   = bits;
-
-	m_cond_var.SignalAll();
-
-	while (m_waiting_threads > 0) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Set;
+	std::printf("NHL27EVFLAG: flags=%llu waits=%llu sets=%llu multi_waiter_sets=%llu would_miss=%llu saved=%llu "
+	            "longest_wait_ms=%.1f\n",
+	            total(c.flags), total(c.waits), total(c.sets), total(c.multi_waiter_sets), total(c.would_miss),
+	            total(c.saved), static_cast<double>(c.longest_wait_us.exchange(0, std::memory_order_relaxed)) / 1000.0);
 }
 
 int KYTY_SYSV_ABI KernelCreateEventFlag(KernelEventFlag* ef, const char* name, uint32_t attr,
@@ -265,7 +127,7 @@ int KYTY_SYSV_ABI KernelCreateEventFlag(KernelEventFlag* ef, const char* name, u
 		default: return KERNEL_ERROR_EINVAL;
 	}
 
-	*ef = new KernelEventFlagPrivate(std::string(name), single, fifo, init_pattern);
+	*ef = new KernelEventFlagPrivate(std::string(name), single, fifo, init_pattern, StartRelease());
 
 	LOGF("\tEventFlag create: %s\n", name);
 
@@ -296,8 +158,9 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	const auto mode     = DecodeEventFlagWaitMode(wait_mode);
+	const int  priority = (ef->Fifo() ? 0 : PthreadGetCurrentPriorityForKernel());
+	auto       result   = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout, priority);
 
 	int ret = OK;
 

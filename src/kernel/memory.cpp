@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/hostStats.h"
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
@@ -4295,6 +4296,42 @@ bool TestWindowsBackingViewModes() {
 		        info.Type == MEM_MAPPED && info.Protect == protection && valid;
 		EXIT_IF(!backing.Unmap(address, size));
 	}
+	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
+}
+
+// KYTY_GUEST_LAZY_COMMIT default (unset): backing pages are committed at the first zero or map, not before.
+bool TestWindowsBackingLazyCommit() {
+	constexpr uint64_t size  = 0x100000;
+	constexpr uint64_t chunk = 0x10000;
+	GuestBackingStore  backing(size);
+	if (!backing.IsAvailable()) {
+		return false;
+	}
+	auto*                    base = reinterpret_cast<volatile uint8_t*>(backing.GetBackingBase());
+	MEMORY_BASIC_INFORMATION info {};
+	const auto               state = [&](uint64_t offset) {
+		return VirtualQuery(const_cast<uint8_t*>(base + offset), &info, sizeof(info)) != 0 ? info.State : 0;
+	};
+	bool valid = state(0) == MEM_RESERVE;
+	// A zero on a fresh range commits it; it reads as zero.
+	valid = backing.ZeroRange(chunk, 2 * chunk) && state(chunk) == MEM_COMMIT && state(3 * chunk) == MEM_RESERVE &&
+	        base[chunk + 7] == 0 && valid;
+	// A map commits its range: a write through the guest view reads back through the alias.
+	void* placeholder = VirtualAlloc2(GetCurrentProcess(), nullptr, chunk, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+	                                  PAGE_NOACCESS, nullptr, 0);
+	if (placeholder == nullptr) {
+		return false;
+	}
+	const auto address = reinterpret_cast<uint64_t>(placeholder);
+	if (backing.MapFixed(address, chunk, 8 * chunk, VirtualMemory::Mode::ReadWrite)) {
+		static_cast<volatile uint8_t*>(placeholder)[0x123] = 0x5a;
+		valid = base[8 * chunk + 0x123] == 0x5a && state(8 * chunk) == MEM_COMMIT && valid;
+		EXIT_IF(!backing.Unmap(address, chunk));
+	} else {
+		valid = false;
+	}
+	// A zero on a committed, written range clears it.
+	valid = backing.ZeroRange(8 * chunk, chunk) && base[8 * chunk + 0x123] == 0 && valid;
 	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
 }
 #endif

@@ -2041,8 +2041,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			vk_copy.updateBuffer(source.snapshot->Handle(), source.ArgsSize(), sizeof(uint32_t), &source.max_count);
 		}
-		if (source.indexed) {
-			if (!m_native_indirect_prep) m_native_indirect_prep = std::make_shared<NativeIndirectPrep>(m_context.GetGraphics());
+		if (source.prep) {
+			if (!m_native_indirect_prep) m_native_indirect_prep = std::make_shared<NativeIndirectPrep>(m_context.GetGraphics(), m_context.GetCommandScheduler());
 			m_native_indirect_prep->Record(buffer, source);
 		}
 		vk::MemoryBarrier copied {};
@@ -2743,7 +2743,9 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (patched && (!graphics.native_draw_parameters_enabled || source.ArgsSize() > UINT32_MAX ||
 	    !std::ranges::all_of(source.shader_regs, [](uint32_t reg) { return reg == Pm4::SH_NOP ||
 	        (reg >= Pm4::SPI_SHADER_USER_DATA_GS_0 && reg <= Pm4::SPI_SHADER_USER_DATA_GS_31); }))) return false;
-	if (source.indexed && (static_cast<uint64_t>(source.max_count) + 63u) / 64u >
+	// source.prep (set by the CP): the prep pass clamps indexed records and zeroes records over the
+	// draw-args guard limit. Only reads here keep this function's control flow and its PGO profile.
+	if (source.prep && (static_cast<uint64_t>(source.max_count) + 63u) / 64u >
 	    graphics.GetPhysicalDeviceProperties().limits.maxComputeWorkGroupCount[0]) return false;
 	if (!graphics.native_indirect_enabled || source.max_count == 0 ||
 	    source.max_count > graphics.GetPhysicalDeviceProperties().limits.maxDrawIndirectCount ||
@@ -2797,10 +2799,10 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	     state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	     state.ps_input_info.input_num != 0)) { ResetBindings(); return false; }
 	auto& scheduler = m_context.GetCommandScheduler();
-	// The snapshot needs a device address whenever the draw path below reads it through one: indexed
+	// The snapshot needs a device address whenever the draw path below reads it through one: prepared
 	// draws (NativeIndirectPrep) and vertex programs built with native draw parameters. The program can
 	// carry native_draw even when this draw's native_draw info is off (Oct 18 crash: Buffer without BDA).
-	const bool snapshot_bda = source.indexed || state.vertex_info[0].native_draw.Enabled() ||
+	const bool snapshot_bda = source.prep || state.vertex_info[0].native_draw.Enabled() ||
 	                          (state.vertex_info[0].stage.program != nullptr &&
 	                           state.vertex_info[0].stage.program->info.native_draw);
 	source.snapshot = std::make_shared<Buffer>(m_context.GetGraphics(), scheduler,

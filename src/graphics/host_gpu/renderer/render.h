@@ -168,6 +168,9 @@ struct NativeIndirectDraw {
 	uint32_t max_count = 0;
 	uint32_t stride = 0;
 	bool indexed = false;
+	// Set by the CP: NativeIndirectPrep runs on the snapshot (indexed clamp, draw-args guard). Non-indexed
+	// records had no check before: NHL 27's VS 5862e85c draw hung the GPU (2026-11-23).
+	bool prep = false;
 	uint64_t index_base = 0;
 	uint32_t index_count_limit = 0;
 	uint32_t index_type = 0;

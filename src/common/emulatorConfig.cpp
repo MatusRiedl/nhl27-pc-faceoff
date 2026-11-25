@@ -7,9 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cpuid.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace Config {
@@ -246,8 +249,8 @@ int GpuStageCpu(GpuStageThread stage) {
 
 void ConfigureGpuStageThread(GpuStageThread stage) {
 	// KYTY_PERF_SAMPLE=1: sample this GPU stage thread (NHL27SAMPLE lines).
-	static constexpr const char* stage_names[] = {"cp", "exec", "record", "resolve", "hostcopy"};
-	Common::Sampler::RegisterCurrentThread(stage_names[static_cast<uint32_t>(stage) % 5u]);
+	static constexpr const char* stage_names[] = {"cp", "exec", "record", "resolve", "hostcopy", "dispres", "drawres"};
+	Common::Sampler::RegisterCurrentThread(stage_names[static_cast<uint32_t>(stage) % 7u]);
 	const auto& cpus = GpuStageCpus();
 	static const bool high_priority = [] {
 		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
@@ -264,6 +267,38 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
 	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
 	std::fflush(stdout);
+}
+
+// Host CPU for crash reports: vendor, model string and SSE4a (Intel has none, so the guest's SSE4a
+// instructions trap to the emulator there). Diagnostics only; kept out of the caller's profile.
+[[gnu::noinline]] static std::string HostCpuDescription() {
+	unsigned int regs[4] {};
+	char         vendor[13] {};
+	__get_cpuid(0, &regs[0], &regs[1], &regs[2], &regs[3]);
+	std::memcpy(vendor, &regs[1], 4);
+	std::memcpy(vendor + 4, &regs[3], 4);
+	std::memcpy(vendor + 8, &regs[2], 4);
+	char brand[49] {};
+	bool sse4a = false;
+	const unsigned int max_extended = __get_cpuid_max(0x80000000u, nullptr);
+	if (max_extended >= 0x80000001u) {
+		__get_cpuid(0x80000001u, &regs[0], &regs[1], &regs[2], &regs[3]);
+		sse4a = (regs[2] & (1u << 6u)) != 0;
+	}
+	if (max_extended >= 0x80000004u) {
+		for (unsigned int leaf = 0; leaf < 3; leaf++) {
+			__get_cpuid(0x80000002u + leaf, &regs[0], &regs[1], &regs[2], &regs[3]);
+			std::memcpy(brand + leaf * 16, regs, 16);
+		}
+	}
+	std::string_view model(brand);
+	while (!model.empty() && model.front() == ' ') {
+		model.remove_prefix(1);
+	}
+	while (!model.empty() && model.back() == ' ') {
+		model.remove_suffix(1);
+	}
+	return std::string("; host ") + vendor + " \"" + std::string(model) + "\" sse4a=" + (sse4a ? "yes" : "no");
 }
 
 static const std::array<int, 7>& GpuStageCpus() {
@@ -285,10 +320,11 @@ static const std::array<int, 7>& GpuStageCpus() {
 			}
 		}
 		const char* value = std::getenv("KYTY_GPU_THREAD_CPUS");
-		std::printf("NHL27CPU: %u logical CPUs, %u cores, %u fast%s%s; stage CPUs %d,%d,%d,%d,%d,%d,%d%s\n",
+		std::printf("NHL27CPU: %u logical CPUs, %u cores, %u fast%s%s; stage CPUs %d,%d,%d,%d,%d,%d,%d%s%s\n",
 		            topology.logical, topology.cores, topology.fast_cores, topology.hybrid ? " (hybrid)" : "",
 		            topology.valid ? "" : " (topology unknown)", result[0], result[1], result[2], result[3],
-		            result[4], result[5], result[6], value != nullptr ? " (KYTY_GPU_THREAD_CPUS overrides)" : "");
+		            result[4], result[5], result[6], value != nullptr ? " (KYTY_GPU_THREAD_CPUS overrides)" : "",
+		            HostCpuDescription().c_str());
 		std::fflush(stdout);
 		if (value == nullptr) {
 			return result;
