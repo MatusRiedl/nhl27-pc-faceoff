@@ -89,7 +89,9 @@ Tested on a Ryzen 7 9800X3D, an RTX 5080 and 32 GB of RAM. Other GPUs have not b
 - **Frame generation** (experimental): input lag goes up a little, the HUD can smear in fast moves, and VSync is
   off while it is on. 3x, 4x and DLSS 5 together with frame generation had little testing.
 - **A broken intro picture** now and then.
-- If your profile shows "Sign in required", press OK. Offline modes work; online modes don't (yet).
+- If your profile shows "Sign in required", press OK. Offline modes work. For Online Versus, start
+  `Play-NHL27-Online.cmd` instead (test, through the CrossCrease server; see [docs/online.md](docs/online.md)).
+  Other online modes don't work (yet).
 - The upstream known bugs (jersey cloth, some skin tones, facial hair, bright pixels, logos) are unchanged.
 
 Hit a crash? Keep `play_log.txt` (Faceoff's **Logs** button opens its folder), note your GPU and driver, and tell us
