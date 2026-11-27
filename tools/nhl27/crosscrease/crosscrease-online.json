@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "game": "nhl27",
+  "server": "nhl27.crosscrease.com",
+  "hosts": {
+    "_comment": "EA hosts go to the CrossCrease server; everything else is blocked. Names are resolved to IPv4 by play-nhl27-online.ps1.",
+    "*.ea.com": "nhl27.crosscrease.com",
+    "*.easports.com": "nhl27.crosscrease.com",
+    "*.tnt-ea.com": "nhl27.crosscrease.com"
+  },
+  "block_unlisted_hosts": true,
+  "http_gateway": "nhl27.crosscrease.com:31328",
+  "trace_file": "crosscrease-online.log",
+  "trace_call_limit": 0,
+  "port_map": {
+    "443": 10443
+  }
+}

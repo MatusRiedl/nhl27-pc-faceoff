@@ -2,6 +2,13 @@
 
 Newest first. Download: [the release page](../../releases/latest).
 
+## Unreleased
+
+- 🌐 **Online Versus (test).** Double-click `Play-NHL27-Online.cmd` to play Online Versus against other players
+  through the [CrossCrease](https://github.com/CrossCrease) server. The first start asks for your online ID. Same
+  build, settings and saves as offline play; offline play is unchanged. Needs NHL 27 update 01.003.001. See
+  [docs/online.md](docs/online.md).
+
 ## v0.40.0
 
 - 🛠️ **The full-match GPU hang is fixed.** The emulator dropped some GPU work as a "depth metadata clear" when the
